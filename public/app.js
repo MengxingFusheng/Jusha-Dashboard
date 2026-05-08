@@ -5,6 +5,7 @@ const els = {
   alertCount: document.querySelector("#alertCount"),
   serverChanBadge: document.querySelector("#serverChanBadge"),
   alertLogs: document.querySelector("#alertLogs"),
+  clearAlertLogs: document.querySelector("#clearAlertLogs"),
   resources: document.querySelector("#resources"),
   resourceCount: document.querySelector("#resourceCount"),
   hiddenMenu: document.querySelector("#hiddenMenu"),
@@ -44,6 +45,7 @@ const tileAlertDrafts = new Map();
 const tileMonitorDrafts = new Map();
 const nodeChartHoverPoints = new Map();
 const dismissedNodeAlertIds = new Set(readDismissedNodeAlertIds());
+const dismissedAlertLogKeys = new Set(readDismissedAlertLogKeys());
 
 els.checkNow.addEventListener("click", () => runAction("/api/check", els.checkNow, "检查完成"));
 els.intervalSeconds.addEventListener("change", saveSamplingInterval);
@@ -59,6 +61,8 @@ els.resources.addEventListener("drop", onResourceDrop);
 els.resources.addEventListener("dragend", onResourceDragEnd);
 els.resources.addEventListener("mousemove", onNodeChartHover);
 els.resources.addEventListener("mouseleave", hideNodeChartTooltip);
+els.alertLogs.addEventListener("click", onAlertLogAction);
+els.clearAlertLogs.addEventListener("click", clearAlertLogs);
 els.hiddenMenu.addEventListener("click", onHiddenMenuAction);
 els.addNodeAlert.addEventListener("click", addNodeAlertRule);
 els.saveNodeAlerts.addEventListener("click", saveNodeAlerts);
@@ -117,15 +121,15 @@ function render(payload) {
 
 function ensureSelectedNode(resources, nodeSettings = {}) {
   if (selectedNodeUuid && resources.some((item) => item.uuid === selectedNodeUuid)) return;
-  const firstVisible = resources.find((item) => !item.uiHidden);
+  const firstVisible = resources.find((item) => !isResourceHidden(item, nodeSettings));
   const firstAny = resources[0];
   selectedNodeUuid = firstVisible?.uuid || firstAny?.uuid || "";
   draftNodeAlerts = cloneAlerts(nodeSettings?.nodeAlerts?.[selectedNodeUuid] || []);
 }
 
 function renderResources(resources, metrics = {}, history = [], nodeSettings = {}, activeAlerts = []) {
-  const visibleResources = sortResources(resources.filter((item) => !item.uiHidden), nodeSettings);
-  const manualHidden = Number(metrics.resourceManuallyHidden || 0);
+  const visibleResources = sortResources(resources.filter((item) => !isResourceHidden(item, nodeSettings)), nodeSettings);
+  const manualHidden = new Set(nodeSettings.hiddenNodeUuids || []).size || Number(metrics.resourceManuallyHidden || 0);
   els.resourceCount.textContent = `展示 ${visibleResources.length} 条 · 手动隐藏 ${manualHidden} 条 · 站点排除 ${Number(metrics.resourceHidden || 0)} 条`;
 
   const series = buildNodeSeries(history);
@@ -195,6 +199,10 @@ function renderResources(resources, metrics = {}, history = [], nodeSettings = {
       </article>
     `;
   }).join("") : `<div class="empty-tile">当前没有可展示节点</div>`;
+}
+
+function isResourceHidden(resource, nodeSettings = {}) {
+  return Boolean(resource?.uiHidden || (resource?.uuid && (nodeSettings.hiddenNodeUuids || []).includes(resource.uuid)));
 }
 
 function renderHiddenMenu(resources, nodeSettings = {}) {
@@ -367,22 +375,44 @@ function getTileMonitorDraft(uuid, storedMonitor = null) {
 }
 
 function renderAlertLogs(activeAlerts, history) {
-  const logs = [
-    ...activeAlerts.map((item) => ({ ...item, live: true })),
-    ...history.flatMap((snapshot) => (snapshot.alerts || []).map((alert) => ({
-      ...alert,
-      snapshotAt: snapshot.checkedAt,
-      live: false
-    })))
-  ].slice(0, 60);
+  const logs = getVisibleAlertLogs(activeAlerts, history);
 
   els.alertCount.textContent = `${logs.length} 条`;
+  els.clearAlertLogs.disabled = logs.length === 0;
   els.alertLogs.innerHTML = logs.length ? logs.map((alert) => `
-    <div class="alert ${alert.severity === "critical" ? "critical" : ""}">
+    <div class="alert ${alert.severity === "critical" ? "critical" : ""}" data-alert-key="${escapeHtml(alert.logKey)}">
+      <button type="button" class="alert-close-button" data-action="dismiss-alert-log" data-alert-key="${escapeHtml(alert.logKey)}" title="清除这条报警" aria-label="清除这条报警">×</button>
       <strong>${escapeHtml(alert.message || alert.id)}</strong>
       <span>${escapeHtml(alert.nodeRemark || alert.metric || "-")} · ${escapeHtml(formatValue(alert.actual))} · ${escapeHtml(formatTime(alert.triggeredAt || alert.snapshotAt))}</span>
     </div>
   `).join("") : `<div class="empty">暂无报警日志</div>`;
+}
+
+function getVisibleAlertLogs(activeAlerts = [], history = []) {
+  return buildAlertLogs(activeAlerts, history)
+    .filter((alert) => !dismissedAlertLogKeys.has(alert.logKey))
+    .slice(0, 60);
+}
+
+function buildAlertLogs(activeAlerts = [], history = []) {
+  return [
+    ...activeAlerts.map((item) => withAlertLogKey({ ...item, live: true })),
+    ...history.flatMap((snapshot) => (snapshot.alerts || []).map((alert) => withAlertLogKey({
+      ...alert,
+      snapshotAt: snapshot.checkedAt,
+      live: false
+    })))
+  ];
+}
+
+function withAlertLogKey(alert) {
+  const time = alert.triggeredAt || alert.snapshotAt || "";
+  const identity = alert.id || alert.message || alert.metric || "";
+  const scope = alert.live ? "live" : "history";
+  return {
+    ...alert,
+    logKey: `${scope}:${identity}:${time}`
+  };
 }
 
 function renderServerChanSettings(settings) {
@@ -428,6 +458,18 @@ function readDismissedNodeAlertIds() {
 
 function writeDismissedNodeAlertIds() {
   localStorage.setItem("dismissedNodeAlertIds", JSON.stringify([...dismissedNodeAlertIds]));
+}
+
+function readDismissedAlertLogKeys() {
+  try {
+    return JSON.parse(localStorage.getItem("dismissedAlertLogKeys") || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function writeDismissedAlertLogKeys() {
+  localStorage.setItem("dismissedAlertLogKeys", JSON.stringify([...dismissedAlertLogKeys]));
 }
 
 function renderSamplingInterval(config = {}) {
@@ -767,6 +809,12 @@ async function onHiddenMenuAction(event) {
   }
 }
 
+function onAlertLogAction(event) {
+  const button = event.target.closest("button[data-action='dismiss-alert-log']");
+  if (!button) return;
+  dismissAlertLog(button.dataset.alertKey);
+}
+
 function onResourceDragStart(event) {
   const tile = event.target.closest(".resource-tile");
   if (!tile) return;
@@ -1050,12 +1098,20 @@ async function updateNodeVisibility(uuid, hidden, button) {
     const body = await res.json();
     if (!res.ok) throw new Error(body.error || "操作失败");
     latestPayload.nodeSettings = body.nodeSettings;
+    syncLocalNodeVisibility(uuid, hidden);
     render(latestPayload);
     els.saveMessage.textContent = hidden ? "节点已隐藏" : "节点已恢复";
   } catch (error) {
     els.saveMessage.textContent = error.message;
   } finally {
     button.disabled = false;
+  }
+}
+
+function syncLocalNodeVisibility(uuid, hidden) {
+  const resources = latestPayload?.state?.latest?.resources || [];
+  for (const resource of resources) {
+    if (resource.uuid === uuid) resource.uiHidden = hidden;
   }
 }
 
@@ -1088,6 +1144,34 @@ function dismissNodeAlert(uuid) {
   writeDismissedNodeAlertIds();
   render(latestPayload);
   els.saveMessage.textContent = "当前节点报警提示已消除";
+}
+
+function dismissAlertLog(logKey) {
+  if (!logKey) return;
+  const alert = buildAlertLogs(latestPayload?.state?.activeAlerts || [], latestPayload?.history || [])
+    .find((item) => item.logKey === logKey);
+  dismissedAlertLogKeys.add(logKey);
+  if (alert?.live && alert.nodeUuid && alert.id) {
+    dismissedNodeAlertIds.add(alert.id);
+    writeDismissedNodeAlertIds();
+  }
+  writeDismissedAlertLogKeys();
+  render(latestPayload);
+  els.saveMessage.textContent = "报警日志已清除";
+}
+
+function clearAlertLogs() {
+  const logs = buildAlertLogs(latestPayload?.state?.activeAlerts || [], latestPayload?.history || [])
+    .filter((alert) => !dismissedAlertLogKeys.has(alert.logKey));
+  if (!logs.length) return;
+  for (const alert of logs) {
+    dismissedAlertLogKeys.add(alert.logKey);
+    if (alert.live && alert.nodeUuid && alert.id) dismissedNodeAlertIds.add(alert.id);
+  }
+  writeDismissedAlertLogKeys();
+  writeDismissedNodeAlertIds();
+  render(latestPayload);
+  els.saveMessage.textContent = "报警日志已全部清除";
 }
 
 async function saveSamplingInterval() {

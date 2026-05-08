@@ -74,7 +74,10 @@
         <section class="panel">
           <div class="panel-head">
             <h2>报警日志</h2>
-            <span id="alertCount" class="badge muted">0 条</span>
+            <div class="actions compact">
+              <span id="alertCount" class="badge muted">0 条</span>
+              <button id="clearAlertLogs" type="button" class="ghost-button danger">清除全部</button>
+            </div>
           </div>
           <div id="alertLogs" class="alert-list"></div>
         </section>
