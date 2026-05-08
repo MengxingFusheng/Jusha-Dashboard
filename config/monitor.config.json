@@ -1,0 +1,98 @@
+{
+  "target": {
+    "name": "Jusha machine resource API",
+    "url": "https://cloud.tingyutech.com/api/jusha/machine/all/list?page=1&size=200",
+    "method": "GET",
+    "headers": {
+      "Accept": "application/json,text/plain,*/*",
+      "Referer": "https://cloud.tingyutech.com/jusha/resource/all"
+    },
+    "timeoutMs": 15000
+  },
+  "schedule": {
+    "intervalSeconds": 120,
+    "historyLimit": 100
+  },
+  "resourceFilter": {
+    "includeMachineStatusMap": [
+      "normal"
+    ],
+    "excludeMachineStatusMap": [
+      "offlineHide"
+    ]
+  },
+  "monitorSeries": {
+    "enabled": true,
+    "lookbackMinutes": 60,
+    "maxPoints": 30
+  },
+  "extractors": [
+    {
+      "key": "apiSuccess",
+      "label": "API success",
+      "type": "jsonPath",
+      "path": "success",
+      "valueType": "boolean"
+    },
+    {
+      "key": "apiCode",
+      "label": "API code",
+      "type": "jsonPath",
+      "path": "code",
+      "valueType": "number"
+    },
+    {
+      "key": "apiMessage",
+      "label": "API message",
+      "type": "jsonPath",
+      "path": "message",
+      "valueType": "text"
+    },
+    {
+      "key": "resourceTotal",
+      "label": "Resource total",
+      "type": "jsonPath",
+      "path": "data.total",
+      "valueType": "number"
+    }
+  ],
+  "rules": [
+    {
+      "id": "http-not-ok",
+      "enabled": true,
+      "metric": "httpStatus",
+      "operator": "notEquals",
+      "value": 200,
+      "severity": "critical",
+      "message": "Target page HTTP status is not 200"
+    },
+    {
+      "id": "api-not-success",
+      "enabled": true,
+      "metric": "apiSuccess",
+      "operator": "notEquals",
+      "value": true,
+      "severity": "warning",
+      "message": "Resource API did not return success; login cookies may be missing or expired"
+    },
+    {
+      "id": "resource-empty",
+      "enabled": false,
+      "metric": "resourceTotal",
+      "operator": "lessOrEqual",
+      "value": 0,
+      "severity": "warning",
+      "message": "Resource list is empty"
+    }
+  ],
+  "email": {
+    "enabled": false,
+    "cooldownSeconds": 600,
+    "subjectPrefix": "[Resource Monitor Alert]"
+  },
+  "serverChan": {
+    "enabled": true,
+    "cooldownSeconds": 600,
+    "subjectPrefix": "[聚沙报警]"
+  }
+}
