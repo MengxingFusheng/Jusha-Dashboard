@@ -10,6 +10,22 @@ node server.js
 
 打开 `http://localhost:3000`。
 
+## Docker
+
+构建镜像：
+
+```bash
+docker build -t jusha-dashboard .
+```
+
+运行容器：
+
+```bash
+docker run -d --name jusha-dashboard -p 3000:3000 --env-file .env -v jusha-dashboard-data:/app/data jusha-dashboard
+```
+
+打开 `http://localhost:3000`。`data` 目录建议挂载为 volume，用来保留运行状态、节点设置和历史数据。
+
 如果当前终端仍然优先命中 Codex 自带的 `node.exe` 并提示“拒绝访问”，可以直接使用完整路径启动：
 
 ```powershell
