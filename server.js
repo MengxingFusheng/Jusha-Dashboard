@@ -310,8 +310,12 @@ async function maybeSendAlert(rule, snapshot) {
   const cooldownMs = Math.max(0, Number(config.serverChan.cooldownSeconds || 0)) * 1000;
   const lastSent = state.lastEmailByRule?.[rule.id] || 0;
   if (Date.now() - lastSent < cooldownMs) return;
-  await sendServerChanAlert({ rule, metricValue: rule.actual ?? snapshot.metrics[rule.metric], snapshot });
-  state.lastEmailByRule = { ...state.lastEmailByRule, [rule.id]: Date.now() };
+  try {
+    await sendServerChanAlert({ rule, metricValue: rule.actual ?? snapshot.metrics[rule.metric], snapshot });
+    state.lastEmailByRule = { ...state.lastEmailByRule, [rule.id]: Date.now() };
+  } catch (error) {
+    console.error(`Server酱推送失败: ${error.message}`);
+  }
 }
 
 function evaluateRules(rules, metrics) {
