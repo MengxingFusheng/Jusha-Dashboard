@@ -1,4 +1,5 @@
-FROM node:20-alpine
+ARG NODE_IMAGE=node:20-alpine
+FROM ${NODE_IMAGE}
 
 WORKDIR /app
 ENV NODE_ENV=production
@@ -8,6 +9,7 @@ COPY package.json ./
 COPY server.js ./
 COPY config ./config
 COPY public ./public
+COPY scripts ./scripts
 COPY data/.gitkeep ./data/.gitkeep
 
 RUN mkdir -p /app/data /app/logs

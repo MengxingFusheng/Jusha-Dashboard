@@ -8,7 +8,17 @@ const els = {
   clearAlertLogs: document.querySelector("#clearAlertLogs"),
   resources: document.querySelector("#resources"),
   resourceCount: document.querySelector("#resourceCount"),
+  resourceTileScale: document.querySelector("#resourceTileScale"),
+  resourceTileScaleValue: document.querySelector("#resourceTileScaleValue"),
   hiddenMenu: document.querySelector("#hiddenMenu"),
+  incomeBadge: document.querySelector("#incomeBadge"),
+  incomeSummary: document.querySelector("#incomeSummary"),
+  incomeTiles: document.querySelector("#incomeTiles"),
+  incomeTileScale: document.querySelector("#incomeTileScale"),
+  incomeTileScaleValue: document.querySelector("#incomeTileScaleValue"),
+  incomeCheckNow: document.querySelector("#incomeCheckNow"),
+  monthlyFixedExpense: document.querySelector("#monthlyFixedExpenseYuan"),
+  saveFixedExpense: document.querySelector("[data-action='save-fixed-expense']"),
   saveMessage: document.querySelector("#saveMessage"),
   cookieBadge: document.querySelector("#cookieBadge"),
   loginForm: document.querySelector("#loginForm"),
@@ -27,6 +37,7 @@ const els = {
   saveNodeAlerts: document.querySelector("#saveNodeAlerts"),
   serverChanForm: document.querySelector("#serverChanForm"),
   serverChanEnabled: document.querySelector("#serverChanEnabled"),
+  serverChanPushItems: document.querySelectorAll("[data-serverchan-push-item]"),
   serverChanSendKey: document.querySelector("#serverChanSendKey"),
   subjectPrefix: document.querySelector("#subjectPrefix"),
   cooldownSeconds: document.querySelector("#cooldownSeconds"),
@@ -39,6 +50,7 @@ let selectedNodeUuid = "";
 let draftNodeAlerts = [];
 let serverChanFormDirty = false;
 let draggedUuid = "";
+let draggedTileKind = "";
 let flippedTileUuid = "";
 let flippedTileMode = "alert";
 const tileAlertDrafts = new Map();
@@ -46,9 +58,17 @@ const tileMonitorDrafts = new Map();
 const nodeChartHoverPoints = new Map();
 const dismissedNodeAlertIds = new Set(readDismissedNodeAlertIds());
 const dismissedAlertLogKeys = new Set(readDismissedAlertLogKeys());
+const TILE_SCALE_LIMITS = { min: 0.85, max: 1.3 };
+const DEFAULT_CHART_LOOKBACK_MINUTES = 24 * 60;
 
 els.checkNow.addEventListener("click", () => runAction("/api/check", els.checkNow, "检查完成"));
+els.incomeCheckNow.addEventListener("click", () => runAction("/api/income/check", els.incomeCheckNow, "收益检查完成"));
+els.monthlyFixedExpense?.addEventListener("change", () => saveMonthlyFixedExpense(els.monthlyFixedExpense));
+els.monthlyFixedExpense?.addEventListener("keydown", onFixedExpenseKeydown);
+els.saveFixedExpense?.addEventListener("click", () => saveMonthlyFixedExpense(els.monthlyFixedExpense, els.saveFixedExpense));
 els.intervalSeconds.addEventListener("change", saveSamplingInterval);
+els.resourceTileScale?.addEventListener("input", () => setTileScale("resource", els.resourceTileScale.value));
+els.incomeTileScale?.addEventListener("input", () => setTileScale("income", els.incomeTileScale.value));
 els.testServerChan.addEventListener("click", () => runAction("/api/test-serverchan", els.testServerChan, "测试推送已提交", els.serverChanMessage));
 els.loginForm.addEventListener("submit", loginAccount);
 els.resources.addEventListener("click", onResourceAction);
@@ -61,6 +81,11 @@ els.resources.addEventListener("drop", onResourceDrop);
 els.resources.addEventListener("dragend", onResourceDragEnd);
 els.resources.addEventListener("mousemove", onNodeChartHover);
 els.resources.addEventListener("mouseleave", hideNodeChartTooltip);
+els.incomeTiles.addEventListener("dragstart", onIncomeDragStart);
+els.incomeTiles.addEventListener("dragover", onIncomeDragOver);
+els.incomeTiles.addEventListener("dragleave", onIncomeDragLeave);
+els.incomeTiles.addEventListener("drop", onIncomeDrop);
+els.incomeTiles.addEventListener("dragend", onIncomeDragEnd);
 els.alertLogs.addEventListener("click", onAlertLogAction);
 els.clearAlertLogs.addEventListener("click", clearAlertLogs);
 els.hiddenMenu.addEventListener("click", onHiddenMenuAction);
@@ -71,10 +96,13 @@ els.nodeAlertList.addEventListener("input", onNodeAlertListInput);
 els.serverChanForm.addEventListener("input", () => {
   serverChanFormDirty = true;
 });
+els.serverChanForm.addEventListener("change", onServerChanFormChange);
 els.saveServerChanSettings.addEventListener("click", saveServerChanSettings);
 document.addEventListener("click", (event) => {
   if (!event.target.closest(".mute-menu-wrap")) closeMuteMenus();
 });
+
+initTileScaleControls();
 
 const events = new EventSource("/events");
 events.onmessage = (event) => render(JSON.parse(event.data));
@@ -83,18 +111,22 @@ events.onerror = () => {
   els.runStatus.className = "badge danger";
 };
 
-fetch("/api/state")
-  .then((res) => res.json())
-  .then(render)
+loadState()
   .catch((error) => {
     els.runStatus.textContent = "读取失败";
     els.runStatus.className = "badge danger";
     els.saveMessage.textContent = error.message;
   });
 
+async function loadState() {
+  return fetch("/api/state")
+  .then((res) => res.json())
+  .then(render);
+}
+
 function render(payload) {
   latestPayload = payload;
-  const { state, config, history, auth, nodeSettings, serverChanSettings } = payload;
+  const { state, config, history, auth, nodeSettings, serverChanSettings, income } = payload;
   const latest = state.latest;
   const metrics = latest?.metrics || {};
   const resources = latest?.resources || [];
@@ -105,18 +137,50 @@ function render(payload) {
   els.runStatus.textContent = latest?.ok ? "正常" : latest ? "异常" : "等待首检";
   els.runStatus.className = `badge ${latest?.ok ? "ok" : latest ? "danger" : "muted"}`;
   els.lastRun.textContent = latest ? `最近检查 ${formatTime(latest.checkedAt)}` : "最近检查 -";
-  els.cookieBadge.textContent = auth?.hasCookie ? `Cookie 已保存 (${auth.cookieLength} 字符)` : "未保存 Cookie";
+  els.cookieBadge.textContent = auth?.hasCookie ? `Cookie 已保存 (${auth.cookieLength} 字)` : "未保存 Cookie";
   els.cookieBadge.className = `badge ${auth?.hasCookie ? "ok" : "muted"}`;
   els.serverChanBadge.textContent = config.serverChan?.enabled ? "推送已启用" : "推送未启用";
   els.serverChanBadge.className = `badge ${config.serverChan?.enabled ? "ok" : "muted"}`;
   renderSamplingInterval(config);
 
   syncDismissedNodeAlerts(state.activeAlerts || []);
-  renderResources(resources, metrics, history || [], nodeSettings || {}, state.activeAlerts || []);
+  renderResources(resources, metrics, history || [], nodeSettings || {}, state.activeAlerts || [], income || {}, config.monitorSeries || {});
+  renderIncomePanel(income || {}, resources, nodeSettings || {}, config || {});
   renderHiddenMenu(resources, nodeSettings);
   renderNodeAlertPanel(resources, nodeSettings);
   renderAlertLogs(state.activeAlerts || [], history || []);
   renderServerChanSettings(serverChanSettings || {});
+}
+
+function initTileScaleControls() {
+  setTileScale("resource", readTileScale("resource"), false);
+  setTileScale("income", readTileScale("income"), false);
+}
+
+function readTileScale(kind) {
+  const raw = localStorage.getItem(`${kind}TileScale`);
+  return clampTileScale(raw || 1);
+}
+
+function setTileScale(kind, value, persist = true) {
+  const scale = clampTileScale(value);
+  const minBase = kind === "resource" ? 320 : 280;
+  const root = document.documentElement;
+  root.style.setProperty(`--${kind}-tile-scale`, String(scale));
+  root.style.setProperty(`--${kind}-tile-min`, `${Math.round(minBase * scale)}px`);
+
+  const input = kind === "resource" ? els.resourceTileScale : els.incomeTileScale;
+  const output = kind === "resource" ? els.resourceTileScaleValue : els.incomeTileScaleValue;
+  if (input) input.value = String(scale);
+  if (output) output.textContent = `${Math.round(scale * 100)}%`;
+  if (persist) localStorage.setItem(`${kind}TileScale`, String(scale));
+}
+
+function clampTileScale(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 1;
+  const rounded = Math.round(number * 20) / 20;
+  return Math.min(TILE_SCALE_LIMITS.max, Math.max(TILE_SCALE_LIMITS.min, rounded));
 }
 
 function ensureSelectedNode(resources, nodeSettings = {}) {
@@ -127,41 +191,44 @@ function ensureSelectedNode(resources, nodeSettings = {}) {
   draftNodeAlerts = cloneAlerts(nodeSettings?.nodeAlerts?.[selectedNodeUuid] || []);
 }
 
-function renderResources(resources, metrics = {}, history = [], nodeSettings = {}, activeAlerts = []) {
+function renderResources(resources, metrics = {}, history = [], nodeSettings = {}, activeAlerts = [], income = {}, monitorSeriesOptions = {}) {
   const visibleResources = sortResources(resources.filter((item) => !isResourceHidden(item, nodeSettings)), nodeSettings);
   const manualHidden = new Set(nodeSettings.hiddenNodeUuids || []).size || Number(metrics.resourceManuallyHidden || 0);
-  els.resourceCount.textContent = `展示 ${visibleResources.length} 条 · 手动隐藏 ${manualHidden} 条 · 站点排除 ${Number(metrics.resourceHidden || 0)} 条`;
+  els.resourceCount.textContent = `显示 ${visibleResources.length} 个 · 手动隐藏 ${manualHidden} 个 · 网站隐藏 ${Number(metrics.resourceHidden || 0)} 个`;
 
-  const series = buildNodeSeries(history);
+  const series = buildNodeSeries(history, monitorSeriesOptions.lookbackMinutes || DEFAULT_CHART_LOOKBACK_MINUTES);
   const activeAlertsByNode = groupActiveAlertsByNode(activeAlerts);
+  const incomeByNode = buildIncomeMap(income);
   nodeChartHoverPoints.clear();
   els.resources.innerHTML = visibleResources.length ? visibleResources.map((item) => {
     const points = series.get(item.uuid) || [];
     const alertCount = (item.nodeAlerts || []).length;
     const activeNodeAlerts = activeAlertsByNode.get(item.uuid) || [];
+    const incomeItem = incomeByNode.get(item.uuid);
     const mute = getActiveNodeMute(item.uuid, nodeSettings);
     const muteActive = Boolean(mute);
     nodeChartHoverPoints.set(item.uuid, getNodeChartHoverPoints(points, item));
     return `
       <article class="resource-tile ${flippedTileUuid === item.uuid ? "is-flipped" : ""}" draggable="${flippedTileUuid === item.uuid ? "false" : "true"}" data-uuid="${escapeHtml(item.uuid)}">
-        ${activeNodeAlerts.length ? `
-          <button type="button" class="tile-alert-button" data-action="dismiss-node-alert" data-uuid="${escapeHtml(item.uuid)}" title="消除当前节点报警提示" aria-label="消除当前节点报警提示">
-            &#128276;
-            <span>${activeNodeAlerts.length}</span>
-          </button>
-        ` : ""}
-        <button type="button" class="tile-hide-button" data-action="hide-node" data-uuid="${escapeHtml(item.uuid)}" title="隐藏节点" aria-label="隐藏节点">×</button>
+        <button type="button" class="tile-hide-button" data-action="hide-node" data-uuid="${escapeHtml(item.uuid)}" title="隐藏" aria-label="隐藏">&times;</button>
         <div class="resource-tile-head">
           <div>
             <div class="node-title-row">
-              <span class="drag-handle" title="拖动排序">≡</span>
+              <span class="drag-handle" title="拖动排序">&#8942;</span>
               <strong>${escapeHtml(item.remark || "未命名节点")}</strong>
+              ${renderUnitPriceTag(incomeItem)}
             </div>
-            <button type="button" class="uuid-button" data-action="copy-uuid" data-uuid="${escapeHtml(item.uuid)}" title="复制真实 UUID">UUID</button>
+            <button type="button" class="uuid-button" data-action="copy-uuid" data-uuid="${escapeHtml(item.uuid)}" title="复制 UUID">UUID</button>
           </div>
           <div class="tile-head-side">
             <span class="status-pill ${item.online === 0 ? "offline" : "online"}">${escapeHtml(item.statusLabel || item.status)}</span>
             <div class="tile-actions">
+              ${activeNodeAlerts.length ? `
+                <button type="button" class="tile-alert-button" data-action="dismiss-node-alert" data-uuid="${escapeHtml(item.uuid)}" title="点击消除节点报警" aria-label="点击消除节点报警">
+                  &#128276;
+                  <span>${activeNodeAlerts.length}</span>
+                </button>
+              ` : ""}
               <div class="mute-menu-wrap">
                 <button type="button" class="icon-button mute-button ${muteActive ? "active" : ""}" data-action="toggle-mute-menu" data-uuid="${escapeHtml(item.uuid)}" title="${escapeHtml(formatMuteTitle(mute))}" aria-label="${escapeHtml(formatMuteTitle(mute))}">
                   &#128277;
@@ -173,11 +240,11 @@ function renderResources(resources, metrics = {}, history = [], nodeSettings = {
                   ${muteActive ? `<button type="button" class="mute-option restore" data-action="mute-alerts" data-duration="none" data-uuid="${escapeHtml(item.uuid)}">解除禁用</button>` : ""}
                 </div>
               </div>
-              <button type="button" class="icon-button monitor-button" data-action="configure-monitor" data-uuid="${escapeHtml(item.uuid)}" title="监控预期" aria-label="监控预期">
-                ◔
+              <button type="button" class="icon-button monitor-button" data-action="configure-monitor" data-uuid="${escapeHtml(item.uuid)}" title="监控设置" aria-label="监控设置">
+                &#128202;
               </button>
               <button type="button" class="icon-button gear-button" data-action="configure-alerts" data-uuid="${escapeHtml(item.uuid)}" title="报警设置" aria-label="报警设置">
-                ⚙
+                &#9881;
                 ${alertCount ? `<span class="alert-count-badge">${alertCount}</span>` : ""}
               </button>
             </div>
@@ -187,6 +254,7 @@ function renderResources(resources, metrics = {}, history = [], nodeSettings = {
           <div><strong>${escapeHtml(formatNumber(item.currentFlowMbps))}<span>Mbps</span></strong></div>
           <div><strong>${escapeHtml(formatNumber(item.bandwidthUsagePercent))}<span>%</span></strong></div>
         </div>
+        ${renderTileIncome(incomeItem, income, item.incomeForecast)}
         <div class="node-chart-wrap">
           <svg class="node-chart" viewBox="0 0 360 150" role="img" aria-label="${escapeHtml(item.remark || item.uuid || "节点")}流量曲线">
             ${renderNodeChart(points, item)}
@@ -198,7 +266,165 @@ function renderResources(resources, metrics = {}, history = [], nodeSettings = {
         </div>
       </article>
     `;
-  }).join("") : `<div class="empty-tile">当前没有可展示节点</div>`;
+  }).join("") : `<div class="empty-tile">没有可显示的节点</div>`;
+}
+
+function renderTileIncome(item, income = {}, forecast = null) {
+  const forecastReady = forecast?.status === "ready";
+  const forecastScaleTitle = forecastReady ? formatForecastScaleTitle(forecast) : "";
+  return `
+    <div class="tile-income-strip">
+      <div>
+        <span>昨日收益</span>
+        <strong>${item ? `¥${escapeHtml(formatCurrency(item.incomeYuan))}` : "-"}</strong>
+      </div>
+      <div>
+        <span>结算流量</span>
+        <strong>${item ? escapeHtml(formatFlowGb(item.flowGb)) : "-"}</strong>
+      </div>
+      <div>
+        <span>预估收益</span>
+        <strong>${forecastReady ? `¥${escapeHtml(formatCurrency(forecast.estimatedIncomeYuan))}` : "-"}</strong>
+      </div>
+      <div ${forecastScaleTitle ? `title="${escapeHtml(forecastScaleTitle)}"` : ""}>
+        <span class="income-label-row">
+          <span>${escapeHtml(formatForecastSettlementLabel(forecast))}</span>
+          ${forecastReady ? `<em>${escapeHtml(formatForecastScaleBadge(forecast))}</em>` : ""}
+        </span>
+        <strong>${forecastReady ? escapeHtml(formatFlowGb(forecast.estimatedSettlementFlowGb)) : "-"}</strong>
+      </div>
+    </div>
+  `;
+}
+
+function formatForecastSettlementLabel(forecast = null) {
+  return "预估结算";
+}
+
+function formatForecastScaleBadge(forecast = null) {
+  if (forecast?.status !== "ready" || !Number(forecast.flowScale)) return "";
+  return formatPercent(Number(forecast.flowScale) * 100);
+}
+
+function formatForecastScaleTitle(forecast = {}) {
+  const parts = [`扣量系数 ${formatPercent(Number(forecast.flowScale || 1) * 100)}`];
+  if (Number(forecast.sampleCount || 0)) parts.push(`样本 ${Number(forecast.sampleCount)} 天`);
+  if (Number(forecast.forecastSampleCount || 0)) parts.push(`历史预估 ${Number(forecast.forecastSampleCount)} 天`);
+  if (Number(forecast.monitorSampleCount || 0)) parts.push(`监控回算 ${Number(forecast.monitorSampleCount)} 天`);
+  return parts.join(" · ");
+}
+
+function renderUnitPriceTag(item) {
+  const monthlyPrice = calculateMonthlyUnitPrice(item);
+  if (!monthlyPrice) return "";
+  return `<span class="node-unit-price">¥${escapeHtml(formatMonthlyUnitPrice(monthlyPrice))}/月</span>`;
+}
+
+function renderIncomePanel(income = {}, resources = [], nodeSettings = {}, config = {}) {
+  const items = Array.isArray(income.items) ? income.items : [];
+  const summary = income.summary || {};
+  const month = income.month || null;
+  const monthTaxRate = Number(month?.taxRate ?? 0.06);
+  const monthlyFixedExpenseYuan = getMonthlyFixedExpenseYuan(config, month);
+  const netProfitYuan = calculateNetProfitYuan(month, monthlyFixedExpenseYuan);
+  els.incomeBadge.textContent = getIncomeStatusText(income);
+  els.incomeBadge.className = `badge ${getIncomeStatusClass(income)}`;
+  if (els.monthlyFixedExpense && document.activeElement !== els.monthlyFixedExpense) {
+    els.monthlyFixedExpense.value = formatExpenseInputValue(monthlyFixedExpenseYuan);
+  }
+  els.incomeSummary.innerHTML = `
+    <div class="income-summary-card">
+      <span>昨日总收益</span>
+      <strong>¥${escapeHtml(formatCurrency(summary.totalIncomeYuan))}</strong>
+    </div>
+    <div class="income-summary-card">
+      <span>昨日总流量</span>
+      <strong>${escapeHtml(formatFlowGb(summary.totalFlowGb))}</strong>
+    </div>
+    <div class="income-summary-card">
+      <span>本月税前收益</span>
+      <strong>${month ? `¥${escapeHtml(formatCurrency(month.totalIncomeYuan))}` : "-"}</strong>
+    </div>
+    <div class="income-summary-card">
+      <span>本月税后收益(${escapeHtml(formatTaxRate(monthTaxRate))})</span>
+      <strong>${month ? `¥${escapeHtml(formatCurrency(month.netIncomeYuan))}` : "-"}</strong>
+    </div>
+    <div class="income-summary-card net-profit">
+      <span>本月净利润</span>
+      <strong>${month ? `¥${escapeHtml(formatCurrency(netProfitYuan))}` : "-"}</strong>
+    </div>
+  `;
+
+  const resourceByUuid = new Map(resources.map((item) => [item.uuid, item]));
+  const order = new Map((nodeSettings.nodeOrderUuids || []).map((uuid, index) => [uuid, index]));
+  const displayItems = items
+    .map((item) => ({ income: item, resource: resourceByUuid.get(item.uuid) }))
+    .sort((left, right) => {
+      const leftHidden = left.resource ? isResourceHidden(left.resource, nodeSettings) : false;
+      const rightHidden = right.resource ? isResourceHidden(right.resource, nodeSettings) : false;
+      if (leftHidden !== rightHidden) return leftHidden ? 1 : -1;
+      const leftOrder = order.has(left.income.uuid) ? order.get(left.income.uuid) : Number.MAX_SAFE_INTEGER;
+      const rightOrder = order.has(right.income.uuid) ? order.get(right.income.uuid) : Number.MAX_SAFE_INTEGER;
+      if (leftOrder !== rightOrder) return leftOrder - rightOrder;
+      return String(left.income.remark || left.resource?.remark || left.income.uuid)
+        .localeCompare(String(right.income.remark || right.resource?.remark || right.income.uuid), "zh-CN");
+    });
+
+  if (!displayItems.length) {
+    const detail = income.error
+      ? `收益读取失败：${income.error}`
+      : income.lastCheckedAt
+        ? `最近 ${formatTime(income.lastCheckedAt)} 检查，暂未读取到收益`
+        : "暂无收益数据";
+    els.incomeTiles.innerHTML = `<div class="empty-tile">${escapeHtml(detail)}</div>`;
+    return;
+  }
+
+  els.incomeTiles.innerHTML = displayItems.map(({ income: item, resource }) => {
+    const name = item.remark || resource?.remark || item.host || "未命名节点";
+    const usage = formatSettlementUsage(item, resource);
+    const status = resource ? (resource.statusLabel || resource.status || "-") : "未匹配节点";
+    return `
+      <article class="income-tile" draggable="true" data-uuid="${escapeHtml(item.uuid)}">
+        <div class="income-tile-head">
+          <div>
+            <div class="income-name-row">
+              <span class="drag-handle" title="拖动排序">&#8942;</span>
+              <strong>${escapeHtml(name)}</strong>
+              ${renderUnitPriceTag(item)}
+            </div>
+            <span>${escapeHtml(item.host || resource?.host || item.uuid)}</span>
+          </div>
+          <span class="status-pill ${resource?.online === 0 ? "offline" : "online"}">${escapeHtml(status)}</span>
+        </div>
+        <div class="income-metrics">
+          <div><span>收益</span><strong>¥${escapeHtml(formatCurrency(item.incomeYuan))}</strong></div>
+          <div><span>占带宽</span><strong>${escapeHtml(usage)}</strong></div>
+          <div><span>结算流量</span><strong>${escapeHtml(formatFlowGb(item.flowGb))}</strong></div>
+        </div>
+        <div class="income-uuid">${escapeHtml(item.uuid)}</div>
+      </article>
+    `;
+  }).join("");
+}
+
+function buildIncomeMap(income = {}) {
+  return new Map((income.items || []).map((item) => [item.uuid, item]));
+}
+
+function getIncomeStatusText(income = {}) {
+  if (income.status === "ready" || income.ready) return `${income.date || "今日"} 已完成`;
+  if (income.status === "checking") return "正在检查";
+  if (income.status === "error") return "检查失败";
+  if (income.status === "waiting") return "等待收益";
+  return "收益未读取";
+}
+
+function getIncomeStatusClass(income = {}) {
+  if (income.status === "ready" || income.ready) return "ok";
+  if (income.status === "error") return "danger";
+  if (income.status === "checking" || income.status === "waiting") return "warn";
+  return "muted";
 }
 
 function isResourceHidden(resource, nodeSettings = {}) {
@@ -209,19 +435,19 @@ function renderHiddenMenu(resources, nodeSettings = {}) {
   const hiddenUuids = new Set(nodeSettings.hiddenNodeUuids || []);
   const hiddenResources = sortResources(resources.filter((item) => hiddenUuids.has(item.uuid)), nodeSettings);
   if (!hiddenResources.length) {
-    els.hiddenMenu.innerHTML = `<span class="badge muted">已隐藏 0 条</span>`;
+    els.hiddenMenu.innerHTML = `<span class="badge muted">已隐藏 0 个</span>`;
     return;
   }
 
   els.hiddenMenu.innerHTML = `
     <details class="hidden-dropdown">
-      <summary class="hidden-summary">已隐藏 ${hiddenResources.length} 条</summary>
+      <summary class="hidden-summary">已隐藏 ${hiddenResources.length} 个</summary>
       <div class="hidden-dropdown-body">
         ${hiddenResources.map((item) => `
           <div class="hidden-node-row">
             <div>
               <strong>${escapeHtml(item.remark || "未命名节点")}</strong>
-              <button type="button" class="uuid-button small" data-action="copy-uuid" data-uuid="${escapeHtml(item.uuid)}" title="复制真实 UUID">UUID</button>
+              <button type="button" class="uuid-button small" data-action="copy-uuid" data-uuid="${escapeHtml(item.uuid)}" title="复制 UUID">UUID</button>
             </div>
             <button type="button" class="ghost-button" data-action="unhide-node" data-uuid="${escapeHtml(item.uuid)}">解除隐藏</button>
           </div>
@@ -235,7 +461,7 @@ function renderNodeAlertPanel(resources, nodeSettings = {}) {
   const resource = resources.find((item) => item.uuid === selectedNodeUuid);
   if (!resource) {
     els.selectedNodeLabel.textContent = "请选择一个节点";
-    els.nodeAlertList.innerHTML = `<div class="empty">还没有可配置的节点</div>`;
+    els.nodeAlertList.innerHTML = `<div class="empty">暂无节点可设置</div>`;
     return;
   }
 
@@ -248,7 +474,7 @@ function renderNodeAlertPanel(resources, nodeSettings = {}) {
       <div class="alert-rule-head">
         <div>
           <strong>报警类型 1</strong>
-          <span>指定时间流量占比低于阈值</span>
+          <span>指定时间点流量低于百分比时触发</span>
         </div>
         <button type="button" class="ghost-button danger" data-action="remove-alert-rule" data-index="${index}">删除</button>
       </div>
@@ -262,12 +488,12 @@ function renderNodeAlertPanel(resources, nodeSettings = {}) {
           <input type="time" data-field="time" data-index="${index}" value="${escapeHtml(rule.time || "00:00")}">
         </label>
         <label>
-          <span>低于百分比触发</span>
+          <span>低于带宽百分比</span>
           <input type="number" min="0" max="999" step="0.01" data-field="thresholdPercent" data-index="${index}" value="${escapeHtml(String(rule.thresholdPercent ?? 0))}">
         </label>
       </div>
     </article>
-  `).join("") : `<div class="empty">当前节点还没有报警规则，点“新增报警”即可添加。</div>`;
+  `).join("") : `<div class="empty">暂无报警规则，点击新增报警开始设置</div>`;
 }
 
 function renderTileAlertSettings(resource) {
@@ -279,10 +505,10 @@ function renderTileAlertSettings(resource) {
           <strong>${escapeHtml(resource.remark || "未命名节点")}</strong>
           <span>报警设置</span>
         </div>
-        <button type="button" class="icon-button" data-action="close-tile-alerts" data-uuid="${escapeHtml(resource.uuid)}" title="返回监控" aria-label="返回监控">×</button>
+        <button type="button" class="icon-button" data-action="close-tile-alerts" data-uuid="${escapeHtml(resource.uuid)}" title="返回" aria-label="返回">&times;</button>
       </div>
       <div class="tile-alert-rules">
-        ${rules.length ? rules.map((rule, index) => renderTileAlertRule(rule, index, resource.uuid)).join("") : `<div class="empty compact-empty">当前节点还没有报警规则</div>`}
+        ${rules.length ? rules.map((rule, index) => renderTileAlertRule(rule, index, resource.uuid)).join("") : `<div class="empty compact-empty">暂无报警规则</div>`}
       </div>
       <div class="tile-alert-footer">
         <button type="button" class="ghost-button" data-action="add-tile-alert-rule" data-uuid="${escapeHtml(resource.uuid)}">新增规则</button>
@@ -299,9 +525,9 @@ function renderTileMonitorSettings(resource) {
       <div class="tile-alert-settings-head">
         <div>
           <strong>${escapeHtml(resource.remark || "未命名节点")}</strong>
-          <span>监控预期</span>
+          <span>监控设置</span>
         </div>
-        <button type="button" class="icon-button" data-action="close-tile-alerts" data-uuid="${escapeHtml(resource.uuid)}" title="返回监控" aria-label="返回监控">×</button>
+        <button type="button" class="icon-button" data-action="close-tile-alerts" data-uuid="${escapeHtml(resource.uuid)}" title="返回" aria-label="返回">&times;</button>
       </div>
       <div class="tile-monitor-form">
         <label class="switch-row">
@@ -327,7 +553,7 @@ function renderTileMonitorSettings(resource) {
         </div>
       </div>
       <div class="tile-alert-footer">
-        <button type="button" class="ghost-button danger" data-action="clear-tile-monitor" data-uuid="${escapeHtml(resource.uuid)}">清除</button>
+        <button type="button" class="ghost-button danger" data-action="clear-tile-monitor" data-uuid="${escapeHtml(resource.uuid)}">清空</button>
         <button type="button" data-action="save-tile-monitor" data-uuid="${escapeHtml(resource.uuid)}">保存</button>
       </div>
     </div>
@@ -338,7 +564,7 @@ function renderTileAlertRule(rule, index, uuid) {
   return `
     <article class="tile-alert-rule" data-uuid="${escapeHtml(uuid)}" data-index="${index}">
       <div class="tile-alert-rule-head">
-        <strong>类型 1</strong>
+        <strong>报警类型 1</strong>
         <button type="button" class="ghost-button danger" data-action="remove-tile-alert-rule" data-uuid="${escapeHtml(uuid)}" data-index="${index}">删除</button>
       </div>
       <label class="switch-row">
@@ -350,7 +576,7 @@ function renderTileAlertRule(rule, index, uuid) {
         <input type="time" data-tile-alert-field="time" data-uuid="${escapeHtml(uuid)}" data-index="${index}" value="${escapeHtml(rule.time || "00:00")}">
       </label>
       <label>
-        <span>流量占比低于</span>
+        <span>低于带宽百分比</span>
         <input type="number" min="0" max="999" step="0.01" data-tile-alert-field="thresholdPercent" data-uuid="${escapeHtml(uuid)}" data-index="${index}" value="${escapeHtml(String(rule.thresholdPercent ?? 0))}">
       </label>
     </article>
@@ -381,11 +607,11 @@ function renderAlertLogs(activeAlerts, history) {
   els.clearAlertLogs.disabled = logs.length === 0;
   els.alertLogs.innerHTML = logs.length ? logs.map((alert) => `
     <div class="alert ${alert.severity === "critical" ? "critical" : ""}" data-alert-key="${escapeHtml(alert.logKey)}">
-      <button type="button" class="alert-close-button" data-action="dismiss-alert-log" data-alert-key="${escapeHtml(alert.logKey)}" title="清除这条报警" aria-label="清除这条报警">×</button>
+      <button type="button" class="alert-close-button" data-action="dismiss-alert-log" data-alert-key="${escapeHtml(alert.logKey)}" title="清除这条" aria-label="清除这条">&times;</button>
       <strong>${escapeHtml(alert.message || alert.id)}</strong>
       <span>${escapeHtml(alert.nodeRemark || alert.metric || "-")} · ${escapeHtml(formatValue(alert.actual))} · ${escapeHtml(formatTime(alert.triggeredAt || alert.snapshotAt))}</span>
     </div>
-  `).join("") : `<div class="empty">暂无报警日志</div>`;
+  `).join("") : `<div class="empty">暂无报警</div>`;
 }
 
 function getVisibleAlertLogs(activeAlerts = [], history = []) {
@@ -418,10 +644,14 @@ function withAlertLogKey(alert) {
 function renderServerChanSettings(settings) {
   if (serverChanFormDirty) return;
   els.serverChanEnabled.checked = Boolean(settings.enabled);
+  const pushItems = settings.pushItems || {};
+  for (const input of els.serverChanPushItems) {
+    input.checked = pushItems[input.dataset.serverchanPushItem] !== false;
+  }
   els.serverChanSendKey.value = "";
   els.serverChanSendKey.placeholder = settings.hasSendKey
-    ? `已保存 ${settings.sendKeyPreview}，留空则保持原 SendKey`
-    : "请输入 Server酱 SendKey";
+    ? `已保存 ${settings.sendKeyPreview}，留空不修改 SendKey`
+    : "填写 Server酱 SendKey";
   els.subjectPrefix.value = settings.subjectPrefix || "[Resource Monitor Alert]";
   els.cooldownSeconds.value = settings.cooldownSeconds ?? 600;
 }
@@ -492,9 +722,9 @@ function getActiveNodeMute(uuid, nodeSettings = {}) {
 }
 
 function formatMuteTitle(mute) {
-  if (!mute) return "禁用报警";
-  if (mute.mode === "permanent") return "报警已永久禁用";
-  return `报警禁用至 ${formatTime(mute.until)}`;
+  if (!mute) return "启用报警";
+  if (mute.mode === "permanent") return "已永久禁用";
+  return `禁用至 ${formatTime(mute.until)}`;
 }
 
 function closeMuteMenus() {
@@ -513,29 +743,54 @@ function sortResources(resources, nodeSettings = {}) {
   });
 }
 
-function buildNodeSeries(history) {
+function buildNodeSeries(history, lookbackMinutes = DEFAULT_CHART_LOOKBACK_MINUTES) {
   const series = new Map();
-  for (const snapshot of [...history].reverse()) {
+  let latestTime = 0;
+  for (const snapshot of history || []) {
+    const snapshotTime = Date.parse(snapshot.checkedAt || "");
     for (const resource of snapshot.resources || []) {
       if (!resource.uuid) continue;
       if (!series.has(resource.uuid)) series.set(resource.uuid, []);
       const bucket = series.get(resource.uuid);
       if (Array.isArray(resource.flowSeries) && resource.flowSeries.length) {
         for (const point of resource.flowSeries) {
+          const checkedAt = point.checkedAt || snapshot.checkedAt;
+          const time = Date.parse(checkedAt || "");
+          const normalizedTime = Number.isFinite(time) ? time : snapshotTime;
+          if (Number.isFinite(normalizedTime)) latestTime = Math.max(latestTime, normalizedTime);
           bucket.push({
-            checkedAt: point.checkedAt || snapshot.checkedAt,
+            time: normalizedTime,
+            checkedAt,
             flow: Number(point.flowMbps || 0),
             bandwidth: Number(resource.bandwidthMbps || 0)
           });
         }
       } else {
+        if (Number.isFinite(snapshotTime)) latestTime = Math.max(latestTime, snapshotTime);
         bucket.push({
+          time: snapshotTime,
           checkedAt: snapshot.checkedAt,
           flow: Number(resource.currentFlowMbps || 0),
           bandwidth: Number(resource.bandwidthMbps || 0)
         });
       }
     }
+  }
+  const minutes = Math.max(5, Number(lookbackMinutes || DEFAULT_CHART_LOOKBACK_MINUTES));
+  const cutoff = latestTime ? latestTime - minutes * 60 * 1000 : 0;
+  for (const [uuid, points] of series.entries()) {
+    const seen = new Set();
+    const filtered = points
+      .filter((point) => !cutoff || !Number.isFinite(point.time) || point.time >= cutoff)
+      .sort((left, right) => (left.time || 0) - (right.time || 0))
+      .filter((point) => {
+        const key = Number.isFinite(point.time) ? String(point.time) : `${point.checkedAt}:${point.flow}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        delete point.time;
+        return true;
+      });
+    series.set(uuid, filtered);
   }
   return series;
 }
@@ -565,7 +820,7 @@ function renderNodeChart(points, item) {
     <polyline class="mini-line mini-flow ${chartTone}" points="${flowLine}"></polyline>
     <circle class="mini-dot" cx="${xFor(values.length - 1)}" cy="${yFor(latest.flow)}" r="4"></circle>
     <text class="mini-label" x="${pad.left}" y="14">100% = ${escapeSvg(formatNumber(bandwidth))} Mbps</text>
-    <text class="mini-label end" x="${width - pad.right}" y="14">${escapeSvg(formatNumber(currentFlow))} Mbps · ${escapeSvg(formatPercent(item.bandwidthUsagePercent))}</text>
+    <text class="mini-label end" x="${width - pad.right}" y="14">${escapeSvg(formatNumber(currentFlow))} Mbps / ${escapeSvg(formatPercent(item.bandwidthUsagePercent))}</text>
     ${ticks.map((tick) => `
       <line class="mini-tick" x1="${xFor(tick.index)}" y1="${baselineY}" x2="${xFor(tick.index)}" y2="${baselineY + 4}"></line>
       <text class="mini-time-label" x="${xFor(tick.index)}" y="${height - 8}">${escapeSvg(formatChartTime(tick.checkedAt))}</text>
@@ -678,7 +933,7 @@ function onNodeChartHover(event) {
 
   tooltip.innerHTML = `
     <strong>${escapeHtml(formatNumber(nearest.flow))} Mbps</strong>
-    <span>${escapeHtml(formatPercent(nearest.percent))} · ${escapeHtml(formatChartTime(nearest.checkedAt))}</span>
+    <span>${escapeHtml(formatPercent(nearest.percent))} / ${escapeHtml(formatChartTime(nearest.checkedAt))}</span>
   `;
   tooltip.style.left = `${left}px`;
   tooltip.style.top = `${top}px`;
@@ -819,6 +1074,7 @@ function onResourceDragStart(event) {
   const tile = event.target.closest(".resource-tile");
   if (!tile) return;
   draggedUuid = tile.dataset.uuid || "";
+  draggedTileKind = "resource";
   tile.classList.add("dragging");
   event.dataTransfer.effectAllowed = "move";
   event.dataTransfer.setData("text/plain", draggedUuid);
@@ -826,7 +1082,7 @@ function onResourceDragStart(event) {
 
 function onResourceDragOver(event) {
   const tile = event.target.closest(".resource-tile");
-  if (!tile || !draggedUuid || tile.dataset.uuid === draggedUuid) return;
+  if (!tile || draggedTileKind !== "resource" || !draggedUuid || tile.dataset.uuid === draggedUuid) return;
   event.preventDefault();
   tile.classList.add("drag-over");
 }
@@ -838,7 +1094,7 @@ function onResourceDragLeave(event) {
 
 async function onResourceDrop(event) {
   const targetTile = event.target.closest(".resource-tile");
-  if (!targetTile || !draggedUuid || targetTile.dataset.uuid === draggedUuid) return;
+  if (!targetTile || draggedTileKind !== "resource" || !draggedUuid || targetTile.dataset.uuid === draggedUuid) return;
   event.preventDefault();
 
   const tiles = [...els.resources.querySelectorAll(".resource-tile")];
@@ -854,16 +1110,70 @@ async function onResourceDrop(event) {
 
 function onResourceDragEnd() {
   draggedUuid = "";
+  draggedTileKind = "";
   for (const tile of els.resources.querySelectorAll(".resource-tile")) {
     tile.classList.remove("dragging", "drag-over");
   }
 }
 
+function onIncomeDragStart(event) {
+  const tile = event.target.closest(".income-tile");
+  if (!tile) return;
+  draggedUuid = tile.dataset.uuid || "";
+  draggedTileKind = "income";
+  tile.classList.add("dragging");
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/plain", draggedUuid);
+}
+
+function onIncomeDragOver(event) {
+  const tile = event.target.closest(".income-tile");
+  if (!tile || draggedTileKind !== "income" || !draggedUuid || tile.dataset.uuid === draggedUuid) return;
+  event.preventDefault();
+  tile.classList.add("drag-over");
+}
+
+function onIncomeDragLeave(event) {
+  const tile = event.target.closest(".income-tile");
+  if (tile) tile.classList.remove("drag-over");
+}
+
+async function onIncomeDrop(event) {
+  const targetTile = event.target.closest(".income-tile");
+  if (!targetTile || draggedTileKind !== "income" || !draggedUuid || targetTile.dataset.uuid === draggedUuid) return;
+  event.preventDefault();
+
+  const tiles = [...els.incomeTiles.querySelectorAll(".income-tile")];
+  const uuids = tiles.map((tile) => tile.dataset.uuid);
+  const from = uuids.indexOf(draggedUuid);
+  const to = uuids.indexOf(targetTile.dataset.uuid);
+  if (from === -1 || to === -1) return;
+
+  uuids.splice(from, 1);
+  uuids.splice(to, 0, draggedUuid);
+  await saveNodeOrder(uuids);
+}
+
+function onIncomeDragEnd() {
+  draggedUuid = "";
+  draggedTileKind = "";
+  for (const tile of els.incomeTiles.querySelectorAll(".income-tile")) {
+    tile.classList.remove("dragging", "drag-over");
+  }
+}
+
 async function saveNodeOrder(uuids) {
-  els.saveMessage.textContent = "正在保存节点排序...";
+  els.saveMessage.textContent = "正在保存排序...";
   try {
     const hidden = latestPayload?.nodeSettings?.hiddenNodeUuids || [];
-    const fullOrder = [...uuids, ...hidden.filter((uuid) => !uuids.includes(uuid))];
+    const existing = latestPayload?.nodeSettings?.nodeOrderUuids || [];
+    const resources = latestPayload?.state?.latest?.resources || [];
+    const known = [...new Set([
+      ...existing,
+      ...resources.map((resource) => resource.uuid).filter(Boolean),
+      ...hidden
+    ])];
+    const fullOrder = [...uuids, ...known.filter((uuid) => !uuids.includes(uuid))];
     const res = await fetch("/api/node-order", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -873,7 +1183,7 @@ async function saveNodeOrder(uuids) {
     if (!res.ok) throw new Error(body.error || "排序保存失败");
     latestPayload.nodeSettings = body.nodeSettings;
     render(latestPayload);
-    els.saveMessage.textContent = "节点排序已保存";
+    els.saveMessage.textContent = "排序已保存";
   } catch (error) {
     els.saveMessage.textContent = error.message;
   }
@@ -929,7 +1239,7 @@ function removeTileAlertRule(uuid, index) {
 
 async function saveTileAlerts(uuid, button) {
   button.disabled = true;
-  els.saveMessage.textContent = "正在保存节点报警设置...";
+  els.saveMessage.textContent = "正在保存报警设置...";
   try {
     const alerts = getTileAlertDraft(uuid);
     const res = await fetch("/api/node-alerts", {
@@ -943,7 +1253,7 @@ async function saveTileAlerts(uuid, button) {
     tileAlertDrafts.set(uuid, cloneAlerts(body.nodeSettings?.nodeAlerts?.[uuid] || []));
     flippedTileUuid = "";
     render(latestPayload);
-    els.saveMessage.textContent = "节点报警设置已保存";
+    els.saveMessage.textContent = "报警设置已保存";
   } catch (error) {
     els.saveMessage.textContent = error.message;
   } finally {
@@ -953,7 +1263,7 @@ async function saveTileAlerts(uuid, button) {
 
 async function saveTileMonitor(uuid, button) {
   button.disabled = true;
-  els.saveMessage.textContent = "正在保存监控预期...";
+  els.saveMessage.textContent = "正在保存监控设置...";
   try {
     const monitor = getTileMonitorDraft(uuid);
     const res = await fetch("/api/node-monitor-setting", {
@@ -967,7 +1277,7 @@ async function saveTileMonitor(uuid, button) {
     tileMonitorDrafts.set(uuid, { ...(body.nodeSettings?.nodeMonitors?.[uuid] || monitor) });
     flippedTileUuid = "";
     render(latestPayload);
-    els.saveMessage.textContent = "监控预期已保存";
+    els.saveMessage.textContent = "监控设置已保存";
   } catch (error) {
     els.saveMessage.textContent = error.message;
   } finally {
@@ -977,7 +1287,7 @@ async function saveTileMonitor(uuid, button) {
 
 async function clearTileMonitor(uuid, button) {
   button.disabled = true;
-  els.saveMessage.textContent = "正在清除监控预期...";
+  els.saveMessage.textContent = "正在清空监控设置...";
   try {
     const res = await fetch("/api/node-monitor-setting", {
       method: "POST",
@@ -985,12 +1295,12 @@ async function clearTileMonitor(uuid, button) {
       body: JSON.stringify({ uuid, monitor: null })
     });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || "清除失败");
+    if (!res.ok) throw new Error(body.error || "清空失败");
     latestPayload.nodeSettings = body.nodeSettings;
     tileMonitorDrafts.delete(uuid);
     flippedTileUuid = "";
     render(latestPayload);
-    els.saveMessage.textContent = "监控预期已清除";
+    els.saveMessage.textContent = "监控设置已清空";
   } catch (error) {
     els.saveMessage.textContent = error.message;
   } finally {
@@ -1036,7 +1346,7 @@ async function saveNodeAlerts() {
     return;
   }
   els.saveNodeAlerts.disabled = true;
-  els.nodeAlertMessage.textContent = "正在保存报警...";
+  els.nodeAlertMessage.textContent = "正在保存...";
   try {
     const res = await fetch("/api/node-alerts", {
       method: "POST",
@@ -1057,16 +1367,47 @@ async function saveNodeAlerts() {
 }
 
 async function saveServerChanSettings() {
+  return persistServerChanSettings({ includeSendKey: true, renderAfterSave: true });
+}
+
+function onServerChanFormChange(event) {
+  if (event.target === els.serverChanEnabled || event.target.matches("[data-serverchan-push-item]")) {
+    serverChanFormDirty = true;
+    persistServerChanSettings({
+      includeSendKey: false,
+      renderAfterSave: false,
+      pendingText: "正在更新推送项目...",
+      successText: "推送项目已更新"
+    });
+  }
+}
+
+function readServerChanPushItems() {
+  return [...els.serverChanPushItems].reduce((items, input) => ({
+    ...items,
+    [input.dataset.serverchanPushItem]: input.checked
+  }), {});
+}
+
+async function persistServerChanSettings({
+  includeSendKey = true,
+  renderAfterSave = true,
+  pendingText = "正在保存 Server酱...",
+  successText = "Server酱设置已保存"
+} = {}) {
   els.saveServerChanSettings.disabled = true;
-  els.serverChanMessage.textContent = "正在保存 Server酱设置...";
+  els.serverChanMessage.textContent = pendingText;
   try {
     const payload = {
       enabled: els.serverChanEnabled.checked,
-      sendKey: els.serverChanSendKey.value.trim(),
       subjectPrefix: els.subjectPrefix.value.trim(),
-      cooldownSeconds: Number(els.cooldownSeconds.value || 0)
+      cooldownSeconds: Number(els.cooldownSeconds.value || 0),
+      pushItems: readServerChanPushItems()
     };
-    if (!payload.sendKey) delete payload.sendKey;
+    if (includeSendKey) {
+      payload.sendKey = els.serverChanSendKey.value.trim();
+      if (!payload.sendKey) delete payload.sendKey;
+    }
     const res = await fetch("/api/serverchan-settings", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1076,9 +1417,15 @@ async function saveServerChanSettings() {
     if (!res.ok) throw new Error(body.error || "保存失败");
     latestPayload.config = body.config;
     latestPayload.serverChanSettings = body.serverChanSettings;
-    serverChanFormDirty = false;
-    render(latestPayload);
-    els.serverChanMessage.textContent = "Server酱设置已保存";
+    if (renderAfterSave) {
+      serverChanFormDirty = false;
+      render(latestPayload);
+    } else if (!els.serverChanSendKey.value.trim()) {
+      serverChanFormDirty = false;
+    }
+    els.serverChanBadge.textContent = body.config?.serverChan?.enabled ? "推送已启用" : "推送未启用";
+    els.serverChanBadge.className = `badge ${body.config?.serverChan?.enabled ? "ok" : "muted"}`;
+    els.serverChanMessage.textContent = successText;
   } catch (error) {
     els.serverChanMessage.textContent = error.message;
   } finally {
@@ -1088,7 +1435,7 @@ async function saveServerChanSettings() {
 
 async function updateNodeVisibility(uuid, hidden, button) {
   button.disabled = true;
-  els.saveMessage.textContent = hidden ? "正在隐藏节点..." : "正在恢复节点...";
+  els.saveMessage.textContent = hidden ? "正在隐藏节点..." : "正在解除隐藏...";
   try {
     const res = await fetch("/api/node-visibility", {
       method: "POST",
@@ -1117,7 +1464,7 @@ function syncLocalNodeVisibility(uuid, hidden) {
 
 async function updateNodeAlertMute(uuid, duration, button) {
   button.disabled = true;
-  els.saveMessage.textContent = "正在保存报警禁用设置...";
+  els.saveMessage.textContent = "正在更新报警禁用状态...";
   try {
     const res = await fetch("/api/node-alert-mute", {
       method: "POST",
@@ -1125,7 +1472,7 @@ async function updateNodeAlertMute(uuid, duration, button) {
       body: JSON.stringify({ uuid, duration })
     });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || "报警禁用设置保存失败");
+    if (!res.ok) throw new Error(body.error || "报警禁用设置失败");
     latestPayload.nodeSettings = body.nodeSettings;
     render(latestPayload);
     els.saveMessage.textContent = duration === "none" ? "报警已恢复" : "报警已禁用";
@@ -1143,7 +1490,7 @@ function dismissNodeAlert(uuid) {
   }
   writeDismissedNodeAlertIds();
   render(latestPayload);
-  els.saveMessage.textContent = "当前节点报警提示已消除";
+  els.saveMessage.textContent = "节点报警已消除";
 }
 
 function dismissAlertLog(logKey) {
@@ -1174,6 +1521,45 @@ function clearAlertLogs() {
   els.saveMessage.textContent = "报警日志已全部清除";
 }
 
+function onFixedExpenseKeydown(event) {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  saveMonthlyFixedExpense(event.target);
+}
+
+async function saveMonthlyFixedExpense(input, button = null) {
+  if (!latestPayload?.config || !input) return;
+  const monthlyFixedExpenseYuan = normalizeExpenseInput(input.value);
+  input.disabled = true;
+  if (button) button.disabled = true;
+  els.saveMessage.textContent = "正在保存固定支出...";
+  try {
+    const nextConfig = {
+      ...latestPayload.config,
+      income: {
+        ...(latestPayload.config.income || {}),
+        monthlyFixedExpenseYuan
+      }
+    };
+    const res = await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(nextConfig)
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || "固定支出保存失败");
+    latestPayload.config = body;
+    render(latestPayload);
+    els.saveMessage.textContent = `固定支出已保存 ¥${formatCurrency(monthlyFixedExpenseYuan)}`;
+  } catch (error) {
+    els.saveMessage.textContent = error.message;
+    render(latestPayload);
+  } finally {
+    input.disabled = false;
+    if (button) button.disabled = false;
+  }
+}
+
 async function saveSamplingInterval() {
   if (!latestPayload?.config) return;
   const intervalSeconds = Math.max(10, Number(els.intervalSeconds.value || 60));
@@ -1196,7 +1582,7 @@ async function saveSamplingInterval() {
     if (!res.ok) throw new Error(body.error || "采集频率保存失败");
     latestPayload.config = body;
     renderSamplingInterval(body);
-    els.saveMessage.textContent = `采集频率已设置为 ${formatInterval(intervalSeconds)}`;
+    els.saveMessage.textContent = `采集频率已保存 ${formatInterval(intervalSeconds)}`;
   } catch (error) {
     els.saveMessage.textContent = error.message;
     renderSamplingInterval(latestPayload.config);
@@ -1207,11 +1593,12 @@ async function saveSamplingInterval() {
 
 async function runAction(url, button, successText, messageEl = els.saveMessage) {
   button.disabled = true;
-  messageEl.textContent = "正在执行...";
+  messageEl.textContent = "处理中...";
   try {
     const res = await fetch(url, { method: "POST" });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || "请求失败");
+    if (!res.ok) throw new Error(body.error || "操作失败");
+    await loadState();
     messageEl.textContent = successText;
   } catch (error) {
     messageEl.textContent = error.message;
@@ -1230,7 +1617,7 @@ async function loginAccount(event) {
   }
 
   els.loginButton.disabled = true;
-  els.loginMessage.textContent = "正在登录并刷新资源数据...";
+  els.loginMessage.textContent = "正在登录并抓取数据...";
   try {
     const res = await fetch("/api/login", {
       method: "POST",
@@ -1240,7 +1627,8 @@ async function loginAccount(event) {
     const body = await res.json();
     if (!res.ok) throw new Error(body.error || "登录失败");
     els.loginPassword.value = "";
-    els.loginMessage.textContent = `${body.message}，HTTP ${body.metrics?.httpStatus ?? "-"}`;
+    await loadState();
+    els.loginMessage.textContent = `${body.message} · HTTP ${body.metrics?.httpStatus ?? "-"}`;
   } catch (error) {
     els.loginMessage.textContent = error.message;
   } finally {
@@ -1275,6 +1663,65 @@ function formatNumber(value) {
   return number.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
 }
 
+function getMonthlyFixedExpenseYuan(config = {}, month = null) {
+  const value = config.income?.monthlyFixedExpenseYuan ?? month?.monthlyFixedExpenseYuan ?? 0;
+  return normalizeExpenseInput(value);
+}
+
+function calculateNetProfitYuan(month = null, monthlyFixedExpenseYuan = 0) {
+  if (!month) return 0;
+  return round(Number(month.netIncomeYuan || 0) - Number(monthlyFixedExpenseYuan || 0), 2);
+}
+
+function normalizeExpenseInput(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return round(Math.max(0, number), 2);
+}
+
+function formatExpenseInputValue(value) {
+  const number = normalizeExpenseInput(value);
+  return Number.isInteger(number) ? String(number) : String(number.toFixed(2)).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function formatCurrency(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return "-";
+  return number.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function formatMonthlyUnitPrice(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return "-";
+  return Math.round(number).toLocaleString("zh-CN", { maximumFractionDigits: 0 });
+}
+
+function formatFlowGb(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return "-";
+  return `${number.toLocaleString("zh-CN", { maximumFractionDigits: 3 })} G`;
+}
+
+function formatSettlementUsage(incomeItem = {}, resource = null) {
+  const settlementMbps = Number(incomeItem.flowGb || 0) * 1000;
+  const bandwidthMbps = Number(resource?.bandwidthMbps || 0);
+  if (!Number.isFinite(settlementMbps) || !Number.isFinite(bandwidthMbps) || bandwidthMbps <= 0) return "-";
+  return formatPercent(percent(settlementMbps, bandwidthMbps));
+}
+
+function calculateMonthlyUnitPrice(item = {}) {
+  const income = Number(item.incomeYuan || 0);
+  const flow = Number(item.flowGb || 0);
+  if (!Number.isFinite(income) || !Number.isFinite(flow) || flow <= 0) return 0;
+  return round((income / flow) * daysInMonth(item.date), 2);
+}
+
+function daysInMonth(dateKey) {
+  const [year, month] = String(dateKey || "").split("-").map(Number);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) return 30;
+  return new Date(year, month, 0).getDate();
+}
+
 function round(value, digits = 2) {
   const factor = 10 ** digits;
   return Math.round(Number(value || 0) * factor) / factor;
@@ -1291,6 +1738,12 @@ function formatPercent(value) {
   const number = Number(value || 0);
   if (!Number.isFinite(number)) return "-";
   return `${number.toLocaleString("zh-CN", { maximumFractionDigits: 2 })}%`;
+}
+
+function formatTaxRate(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "6%";
+  return formatPercent(number > 1 ? number : number * 100);
 }
 
 function formatInterval(seconds) {

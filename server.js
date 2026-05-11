@@ -11,14 +11,18 @@ const CONFIG_PATH = path.join(__dirname, "config", "monitor.config.json");
 const HISTORY_PATH = path.join(__dirname, "data", "history.json");
 const STATE_PATH = path.join(__dirname, "data", "state.json");
 const NODE_SETTINGS_PATH = path.join(__dirname, "data", "node-settings.json");
+const INCOME_PATH = path.join(__dirname, "data", "income.json");
+const FORECAST_PATH = path.join(__dirname, "data", "forecast.json");
 const ENV_PATH = path.join(__dirname, ".env");
 const PUBLIC_DIR = path.join(__dirname, "public");
 
 await loadEnv(ENV_PATH);
 
 const PORT = Number(process.env.PORT || 3000);
+const FORECAST_VERSION = 4;
+const HISTORY_BACKFILL_TAG = "monitor-history-backfill";
 
-let config = await readJson(CONFIG_PATH);
+let config = normalizeConfig(await readJson(CONFIG_PATH));
 let history = await readJson(HISTORY_PATH, []);
 let state = await readJson(STATE_PATH, {
   running: true,
@@ -27,13 +31,21 @@ let state = await readJson(STATE_PATH, {
   latest: null,
   activeAlerts: [],
   lastEmailByRule: {},
-  lastNodeAlertByRule: {}
+  lastNodeAlertByRule: {},
+  historyBackfill: null
 });
 let nodeSettings = normalizeNodeSettings(await readJson(NODE_SETTINGS_PATH, {}));
+let incomeState = normalizeIncomeState(await readJson(INCOME_PATH, {}));
+let forecastState = normalizeForecastState(await readJson(FORECAST_PATH, {}));
 let timer = null;
+let incomeTimer = null;
+let backfillRunning = false;
+let postLoginRefreshRunning = false;
+let startupBackfillPending = Boolean(process.env.MONITOR_COOKIE);
 const clients = new Set();
 
 startScheduler();
+startIncomeScheduler();
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -49,6 +61,7 @@ const server = http.createServer(async (req, res) => {
     if (req.url === "/api/node-order" && req.method === "POST") return updateNodeOrder(req, res);
     if (req.url === "/api/serverchan-settings" && req.method === "POST") return updateServerChanSettings(req, res);
     if (req.url === "/api/check" && req.method === "POST") return runCheckEndpoint(res);
+    if (req.url === "/api/income/check" && req.method === "POST") return runIncomeEndpoint(res);
     if (req.url === "/api/test-serverchan" && req.method === "POST") return testServerChanEndpoint(res);
     if (req.url?.startsWith("/api/")) return sendJson(res, { error: "Not found" }, 404);
     return serveStatic(req, res);
@@ -74,15 +87,45 @@ function startScheduler() {
   }, delay);
 }
 
+function startIncomeScheduler(delayOverride = null) {
+  clearTimeout(incomeTimer);
+  if (!config.income?.enabled) return;
+  const delay = delayOverride ?? getIncomeSchedulerDelay(new Date());
+  incomeTimer = setTimeout(async () => {
+    const result = await runIncomeCheck();
+    const retryMinutes = Math.max(1, Number(config.income?.retryIntervalMinutes || 15));
+    startIncomeScheduler(result?.ready ? null : retryMinutes * 60 * 1000);
+  }, delay);
+}
+
+function getIncomeSchedulerDelay(now) {
+  const startMinutes = hmToMinutes(config.income?.startTime || "06:30") ?? 390;
+  const currentMinutes = hmToMinutes(formatShanghaiMinute(now)) ?? (now.getHours() * 60 + now.getMinutes());
+  const todayTarget = getYesterdayDateKey(now);
+  if (currentMinutes >= startMinutes && incomeState.date !== todayTarget) return 1000;
+
+  const next = new Date(now);
+  next.setSeconds(0, 0);
+  next.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  return Math.max(1000, next.getTime() - now.getTime());
+}
+
 async function runCheckEndpoint(res) {
   const result = await runCheck();
   startScheduler();
   return sendJson(res, result);
 }
 
+async function runIncomeEndpoint(res) {
+  const result = await runIncomeCheck({ force: true });
+  startIncomeScheduler();
+  return sendJson(res, result);
+}
+
 async function testServerChanEndpoint(res) {
   await sendServerChanAlert({
-    rule: { id: "test-serverchan", severity: "info", message: "这是一条 Server酱测试推送" },
+    rule: { id: "test-serverchan", severity: "info", message: "这是一条 Server酱测试消息" },
     metricValue: "OK",
     snapshot: state.latest || { metrics: {}, target: config.target, checkedAt: new Date().toISOString() }
   }, true);
@@ -92,7 +135,7 @@ async function testServerChanEndpoint(res) {
 async function loginEndpoint(req, res) {
   const { username, password } = await readBodyJson(req);
   if (!username || !password) {
-    return sendJson(res, { error: "请输入账号和密码" }, 400);
+    return sendJson(res, { error: "账号和密码不能为空" }, 400);
   }
 
   const login = await loginTargetSite({ username, password });
@@ -103,25 +146,47 @@ async function loginEndpoint(req, res) {
   process.env.MONITOR_COOKIE = login.cookie;
   await upsertEnvValue(ENV_PATH, "MONITOR_COOKIE", login.cookie);
   await upsertEnvValue(ENV_PATH, "MONITOR_USER_AGENT", defaultUserAgent());
-  const snapshot = await runCheck();
-  startScheduler();
+  await publish();
+  queuePostLoginRefresh();
   return sendJson(res, {
     ok: true,
-    message: "登录成功，Cookie 已保存",
+    message: "登录成功，正在后台抓取数据",
     username,
-    checkedAt: snapshot.checkedAt,
-    metrics: snapshot.metrics,
-    alerts: snapshot.alerts || []
+    checkedAt: new Date().toISOString(),
+    metrics: state.latest?.metrics || {},
+    alerts: state.activeAlerts || [],
+    income: incomeState,
+    background: true
   });
+}
+
+function queuePostLoginRefresh() {
+  if (postLoginRefreshRunning) return;
+  postLoginRefreshRunning = true;
+  void (async () => {
+    try {
+      await runCheck({ forceBackfill: true });
+      startScheduler();
+      await runIncomeCheck({ force: true });
+      startIncomeScheduler();
+    } catch (error) {
+      console.error(`登录后后台抓取失败: ${error.message}`);
+    } finally {
+      postLoginRefreshRunning = false;
+    }
+  })();
 }
 
 async function updateConfig(req, res) {
   const next = await readBodyJson(req);
   validateConfig(next);
-  config = next;
+  config = normalizeConfig(next);
+  incomeState = normalizeIncomeState(incomeState);
   await writeJson(CONFIG_PATH, config);
+  await persistIncomeState();
   await publish();
   startScheduler();
+  startIncomeScheduler();
   return sendJson(res, config);
 }
 
@@ -209,12 +274,13 @@ async function updateNodeOrder(req, res) {
 
 async function updateServerChanSettings(req, res) {
   const body = await readBodyJson(req);
-  config.serverChan = {
-    ...(config.serverChan || {}),
+  config.serverChan = normalizeServerChanConfig({
+    ...config.serverChan,
     enabled: Boolean(body.enabled),
     cooldownSeconds: Math.max(0, Number(body.cooldownSeconds || 0)),
-    subjectPrefix: String(body.subjectPrefix || "[Resource Monitor Alert]")
-  };
+    subjectPrefix: String(body.subjectPrefix || "[Resource Monitor Alert]"),
+    pushItems: normalizeServerChanPushItems(body.pushItems ?? config.serverChan?.pushItems)
+  });
   await writeJson(CONFIG_PATH, config);
 
   const envUpdates = {
@@ -231,14 +297,431 @@ async function updateServerChanSettings(req, res) {
   return sendJson(res, { ok: true, config, serverChanSettings: getPublicServerChanSettings() });
 }
 
-async function runCheck() {
+async function runIncomeCheck({ force = false, targetDate = getYesterdayDateKey(new Date()) } = {}) {
+  if (!force && incomeState.date === targetDate && incomeState.ready) {
+    if (incomeState.notification?.date !== targetDate) {
+      incomeState = await maybeSendIncomeNotification(incomeState);
+      await persistIncomeState();
+      await publish();
+    }
+    return incomeState;
+  }
+
   const checkedAt = new Date().toISOString();
+  const retryMinutes = Math.max(1, Number(config.income?.retryIntervalMinutes || 15));
+  const previousItems = incomeState.date === targetDate ? incomeState.items || [] : [];
+  const previousMonth = incomeState.date === targetDate ? incomeState.month : null;
+  const previousNotification = incomeState.date === targetDate ? incomeState.notification : null;
+  incomeState = normalizeIncomeState({
+    date: targetDate,
+    targetDate,
+    ready: false,
+    status: "checking",
+    lastCheckedAt: checkedAt,
+    nextCheckAt: null,
+    error: null,
+    items: previousItems,
+    summary: summarizeIncomeItems(previousItems),
+    month: previousMonth,
+    notification: previousNotification
+  });
+  await persistIncomeState();
+  await publish();
+
+  try {
+    const rows = await fetchIncomeDetail(targetDate);
+    const items = rows
+      .map((item) => normalizeIncomeItem(item, targetDate))
+      .filter((item) => item.uuid);
+    const ready = items.length > 0;
+    const month = ready ? await fetchMonthlyIncomeSummary(targetDate, items) : previousMonth;
+    incomeState = normalizeIncomeState({
+      date: targetDate,
+      targetDate,
+      ready,
+      status: ready ? "ready" : "waiting",
+      lastCheckedAt: checkedAt,
+      nextCheckAt: ready ? null : new Date(Date.now() + retryMinutes * 60 * 1000).toISOString(),
+      error: null,
+      items,
+      summary: summarizeIncomeItems(items),
+      month,
+      notification: previousNotification
+    });
+    if (ready) incomeState = await maybeSendIncomeNotification(incomeState);
+  } catch (error) {
+    incomeState = normalizeIncomeState({
+      date: targetDate,
+      targetDate,
+      ready: previousItems.length > 0,
+      status: "error",
+      lastCheckedAt: checkedAt,
+      nextCheckAt: new Date(Date.now() + retryMinutes * 60 * 1000).toISOString(),
+      error: error.message || "收益检查失败",
+      items: previousItems,
+      summary: summarizeIncomeItems(previousItems),
+      month: previousMonth,
+      notification: previousNotification
+    });
+  }
+
+  await persistIncomeState();
+  await publish();
+  return incomeState;
+}
+
+async function maybeSendIncomeNotification(income) {
+  if (!income.ready || !income.date || income.notification?.date === income.date) return income;
+  if (!isServerChanPushEnabled("incomeSummary")) return income;
+
+  const notification = {
+    ...(income.notification || {}),
+    error: null,
+    failedAt: null
+  };
+
+  try {
+    await sendIncomeServerChanNotification(income);
+    notification.date = income.date;
+    notification.sentAt = new Date().toISOString();
+  } catch (error) {
+    notification.error = error.message || "收益推送失败";
+    notification.failedAt = new Date().toISOString();
+    console.error(`收益推送失败: ${notification.error}`);
+  }
+
+  return normalizeIncomeState({
+    ...income,
+    notification
+  });
+}
+
+async function sendIncomeServerChanNotification(income) {
+  if (!process.env.SERVERCHAN_SENDKEY) throw new Error("Server酱 SendKey 未配置");
+
+  await postServerChanMessage(
+    `${config.serverChan?.subjectPrefix || "[聚沙]"} ${income.date} 收益`,
+    buildIncomeServerChanMessage(income)
+  );
+}
+
+function buildIncomeServerChanMessage(income) {
+  const summary = income.summary || summarizeIncomeItems(income.items || []);
+  const month = income.month || null;
+  const items = income.items || [];
+  const detail = items.length
+    ? items.map((item) => `- ${item.remark || item.host || item.uuid}: 收益 ¥${formatCurrencyText(item.incomeYuan)}，结算流量 ${formatGbText(item.flowGb)}`).join("\n")
+    : "- 暂无收益明细";
+  const monthlyLines = month ? [
+    `- 本月税前收益: ¥${formatCurrencyText(month.totalIncomeYuan)}`,
+    `- 本月税后收益(${formatPercentText(month.taxRate * 100)}%): ¥${formatCurrencyText(month.netIncomeYuan)}`,
+    `- 每月固定支出: ¥${formatCurrencyText(month.monthlyFixedExpenseYuan)}`,
+    `- 本月净利润: ¥${formatCurrencyText(month.netProfitYuan)}`
+  ] : [];
+
+  return [
+    `### 聚沙收益 ${income.date}`,
+    "",
+    `- 昨日收益: ¥${formatCurrencyText(summary.totalIncomeYuan)}`,
+    `- 昨日流量: ${formatGbText(summary.totalFlowGb)}`,
+    ...monthlyLines,
+    `- 节点数量: ${summary.count || items.length} 个`,
+    "",
+    "#### 收益明细",
+    detail
+  ].join("\n");
+}
+
+async function fetchIncomeDetail(date) {
+  const url = new URL(`https://cloud.tingyutech.com/api/jusha/bill/base/resource/settlement/incomeDetail/exact/${encodeURIComponent(date)}`);
+  url.searchParams.set("billType", String(Number(config.income?.billType ?? 0)));
+
+  const response = await fetchWithRetry(url, {
+    headers: {
+      "Accept": "application/json,text/plain,*/*",
+      "Referer": "https://cloud.tingyutech.com/jusha/customer/bill/upstream",
+      ...(process.env.MONITOR_COOKIE ? { Cookie: process.env.MONITOR_COOKIE } : {}),
+      ...(process.env.MONITOR_USER_AGENT ? { "User-Agent": process.env.MONITOR_USER_AGENT } : {})
+    },
+    redirect: "follow"
+  }, {
+    timeoutMs: Number(config.target?.timeoutMs || 15000),
+    label: "收益接口"
+  });
+  const text = await response.text();
+  let payload = {};
+  try { payload = JSON.parse(text); } catch {}
+  if (!response.ok || payload.success === false) {
+    throw new Error(payload.message || text || `收益接口 HTTP ${response.status}`);
+  }
+
+  if (Array.isArray(payload?.data?.list)) return payload.data.list;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.list)) return payload.list;
+  return [];
+}
+
+function normalizeIncomeItem(item, date) {
+  const flowGb = readFirstNumber(item, ["flow", "realityFlow", "settlementFlow", "totalFlow"]);
+  const incomeCents = readIncomeCents(item);
+  const incomeYuan = round(incomeCents / 100, 2);
+  const itemDate = item.date || date;
+  const normalizedFlowGb = round(flowGb || 0, 3);
+
+  return {
+    date: String(itemDate),
+    uuid: String(item.uuid || ""),
+    host: String(item.host || item.ip || ""),
+    remark: String(item.desc || item.remark || item.descSub || ""),
+    subUsername: String(item.subUsername || ""),
+    serviceId: item.serviceId ?? null,
+    billType: item.billType ?? null,
+    groupType: item.groupType ?? null,
+    flowGb: normalizedFlowGb,
+    incomeCents,
+    incomeYuan,
+    unitPriceYuanPerMonth: calculateMonthlyUnitPrice(incomeYuan, normalizedFlowGb, itemDate)
+  };
+}
+
+function readIncomeCents(item) {
+  const cents = readFirstNumber(item, ["incomeTP", "realityPriceTP", "totalPriceTP", "totalIncomeTP"]);
+  if (cents !== null) return Math.round(cents);
+  const yuan = readFirstNumber(item, ["income", "realityPrice", "totalPrice", "totalIncome"]);
+  return yuan === null ? 0 : Math.round(yuan * 100);
+}
+
+function calculateMonthlyUnitPrice(incomeYuan, flowGb, dateKey) {
+  const income = Number(incomeYuan || 0);
+  const flow = Number(flowGb || 0);
+  if (!Number.isFinite(income) || !Number.isFinite(flow) || flow <= 0) return 0;
+  return round((income / flow) * daysInMonth(dateKey), 2);
+}
+
+function summarizeIncomeItems(items = []) {
+  return {
+    count: items.length,
+    totalFlowGb: round(items.reduce((sum, item) => sum + Number(item.flowGb || 0), 0), 3),
+    totalIncomeCents: Math.round(items.reduce((sum, item) => sum + Number(item.incomeCents || 0), 0)),
+    totalIncomeYuan: round(items.reduce((sum, item) => sum + Number(item.incomeYuan || 0), 0), 2)
+  };
+}
+
+async function fetchMonthlyIncomeSummary(targetDate, targetItems = []) {
+  const dates = getMonthDateKeys(targetDate);
+  const allItems = [];
+  const failedDates = [];
+  let settlementDays = 0;
+
+  for (const date of dates) {
+    try {
+      const items = date === targetDate
+        ? targetItems
+        : (await fetchIncomeDetail(date))
+          .map((item) => normalizeIncomeItem(item, date))
+          .filter((item) => item.uuid);
+      if (items.length) settlementDays += 1;
+      allItems.push(...items);
+    } catch (error) {
+      failedDates.push({
+        date,
+        error: error.message || "monthly income fetch failed"
+      });
+    }
+  }
+
+  const summary = summarizeIncomeItems(allItems);
+  return normalizeIncomeMonth({
+    month: String(targetDate || "").slice(0, 7),
+    startDate: dates[0] || targetDate,
+    endDate: targetDate,
+    checkedDays: dates.length,
+    settlementDays,
+    failedDates,
+    ...summary
+  });
+}
+
+async function hydrateIncomeForecasts(resources, checkedAt) {
+  const options = normalizeIncomeForecastOptions(config.incomeForecast);
+  if (!options.enabled || !resources.length || !process.env.MONITOR_COOKIE) {
+    applyForecastState(resources);
+    return;
+  }
+
+  const today = formatShanghaiDate(checkedAt);
+  if (isForecastCacheFresh(today, options.refreshMinutes)) {
+    applyForecastState(resources);
+    return;
+  }
+
+  const updatedAt = new Date().toISOString();
+  const dates = getPreviousDateKeys(checkedAt, options.historyDays);
+  const incomeHistory = await fetchForecastIncomeHistory(dates);
+  const items = {};
+
+  await Promise.all(resources.map(async (resource) => {
+    try {
+      const forecast = await buildIncomeForecast(resource, checkedAt, dates, incomeHistory, options, updatedAt);
+      if (!forecast) return;
+      items[resource.uuid] = forecast;
+      resource.incomeForecast = forecast;
+    } catch (error) {
+      const cached = forecastState.items?.[resource.uuid];
+      resource.incomeForecast = cached || {
+        date: today,
+        status: "error",
+        error: error.message || "收益预估失败",
+        updatedAt
+      };
+      items[resource.uuid] = resource.incomeForecast;
+    }
+  }));
+
+  const forecastHistory = mergeForecastHistory(forecastState.history, forecastState.date, forecastState.items);
+  forecastState = normalizeForecastState({
+    version: FORECAST_VERSION,
+    date: today,
+    updatedAt,
+    items,
+    history: mergeForecastHistory(forecastHistory, today, items)
+  });
+  await persistForecastState();
+}
+
+function isForecastCacheFresh(today, refreshMinutes) {
+  if (forecastState.version !== FORECAST_VERSION) return false;
+  if (forecastState.date !== today || !forecastState.updatedAt) return false;
+  const ageMs = Date.now() - Date.parse(forecastState.updatedAt);
+  return Number.isFinite(ageMs) && ageMs >= 0 && ageMs < refreshMinutes * 60 * 1000;
+}
+
+function applyForecastState(resources) {
+  const items = forecastState.items || {};
+  for (const resource of resources) {
+    if (items[resource.uuid]) resource.incomeForecast = items[resource.uuid];
+  }
+}
+
+async function fetchForecastIncomeHistory(dates) {
+  const result = new Map();
+  await Promise.all(dates.map(async (date) => {
+    try {
+      const rows = await fetchIncomeDetail(date);
+      const items = rows
+        .map((item) => normalizeIncomeItem(item, date))
+        .filter((item) => item.uuid && item.flowGb > 0 && item.incomeYuan > 0);
+      result.set(date, new Map(items.map((item) => [item.uuid, item])));
+    } catch {
+      result.set(date, new Map());
+    }
+  }));
+  return result;
+}
+
+async function buildIncomeForecast(resource, checkedAt, dates, incomeHistory, options, updatedAt) {
+  const today = formatShanghaiDate(checkedAt);
+  const todayRange = getShanghaiDayRange(today, new Date(checkedAt));
+  const todaySeries = await fetchResourceMonitorSeries(resource.uuid, todayRange.start, todayRange.end, {
+    ...config.monitorSeries,
+    maxPoints: options.maxMonitorPoints
+  });
+  if (!todaySeries.length) return null;
+  const todayP95Mbps = billingP95(todaySeries.map((point) => point.flowMbps));
+
+  const samples = [];
+  const fallbackPrices = [];
+  for (const date of dates) {
+    const incomeItem = incomeHistory.get(date)?.get(resource.uuid);
+    if (!incomeItem) continue;
+    if (incomeItem.flowGb > 0) {
+      fallbackPrices.push(incomeItem.incomeYuan / incomeItem.flowGb);
+    }
+
+    try {
+      const historicalForecast = getHistoricalForecast(resource.uuid, date);
+      let p95FlowGb = readForecastRawFlowGb(historicalForecast);
+      if (!p95FlowGb) {
+        const range = getShanghaiDayRange(date);
+        const series = await fetchResourceMonitorSeries(resource.uuid, range.start, range.end, {
+          ...config.monitorSeries,
+          maxPoints: options.maxMonitorPoints
+        });
+        const p95Mbps = billingP95(series.map((point) => point.flowMbps));
+        p95FlowGb = round(p95Mbps / 1000, 3);
+      }
+      if (p95FlowGb <= 0 || incomeItem.flowGb <= 0) continue;
+      const forecastScale = historicalForecast?.estimatedSettlementFlowGb > 0
+        ? incomeItem.flowGb / historicalForecast.estimatedSettlementFlowGb
+        : 0;
+      samples.push({
+        date,
+        p95FlowGb,
+        settlementFlowGb: incomeItem.flowGb,
+        incomeYuan: incomeItem.incomeYuan,
+        unitPriceYuanPerGb: incomeItem.incomeYuan / incomeItem.flowGb,
+        flowScale: incomeItem.flowGb / p95FlowGb,
+        forecastScale,
+        source: historicalForecast ? "forecast" : "monitor"
+      });
+    } catch {
+      // A missing historical curve should not block today's estimate.
+    }
+  }
+
+  const unitPriceYuanPerGb = weightedAverage(
+    samples.map((sample) => ({ value: sample.unitPriceYuanPerGb, weight: sample.settlementFlowGb }))
+  ) || average(fallbackPrices);
+  if (!unitPriceYuanPerGb) return null;
+
+  const todayP95FlowGb = round(todayP95Mbps / 1000, 3);
+  const rawFlowScale = weightedAverage(
+    samples.map((sample) => ({ value: sample.flowScale, weight: sample.settlementFlowGb }))
+  );
+  const flowScale = normalizeForecastFlowScale(rawFlowScale || 1, options);
+  const forecastAccuracyScale = weightedAverage(
+    samples
+      .filter((sample) => sample.source === "forecast")
+      .map((sample) => ({ value: sample.forecastScale, weight: sample.settlementFlowGb }))
+  );
+  const estimatedSettlementFlowGb = round(todayP95FlowGb * flowScale, 3);
+  const estimatedIncomeYuan = round(estimatedSettlementFlowGb * unitPriceYuanPerGb, 2);
+  const forecastSampleCount = samples.filter((sample) => sample.source === "forecast").length;
+  const monitorSampleCount = samples.length - forecastSampleCount;
+
+  return {
+    date: today,
+    status: "ready",
+    updatedAt,
+    estimatedIncomeYuan,
+    estimatedSettlementFlowGb,
+    todayP95Mbps: round(todayP95Mbps, 2),
+    todayP95FlowGb,
+    unitPriceYuanPerGb: round(unitPriceYuanPerGb, 2),
+    flowScale,
+    rawFlowScale: round(rawFlowScale || 1, 4),
+    forecastAccuracyScale: round(forecastAccuracyScale || 0, 4),
+    rawEstimatedSettlementFlowGb: todayP95FlowGb,
+    sampleCount: samples.length,
+    forecastSampleCount,
+    monitorSampleCount,
+    fallbackPriceCount: fallbackPrices.length,
+    historyDates: samples.map((sample) => sample.date),
+    adjustmentDates: samples.map((sample) => sample.date),
+    pointCount: todaySeries.length
+  };
+}
+
+async function runCheck({ forceBackfill = false } = {}) {
+  const checkedAt = new Date().toISOString();
+  const previousLastRun = state.lastRun;
   let snapshot;
   try {
     const response = await fetchTarget(config.target);
     const metrics = extractMetrics(response, config.extractors || []);
     const { resources, hiddenCount, rawCount } = extractResources(response, config.resourceFilter);
     await hydrateResourceMonitorSeries(resources, config.monitorSeries);
+    await hydrateIncomeForecasts(resources, checkedAt);
     applyNodeSettings(resources, nodeSettings);
     const resourceSummary = summarizeResources(resources);
     metrics.httpStatus = response.statusCode;
@@ -293,7 +776,7 @@ async function runCheck() {
   state.lastRun = checkedAt;
   state.latest = snapshot;
   state.activeAlerts = alerts;
-  history = [snapshot, ...history].slice(0, Number(config.schedule?.historyLimit || 100));
+  history = trimHistory([snapshot, ...history]);
 
   for (const alert of alerts) {
     await maybeSendAlert(alert, snapshot);
@@ -302,11 +785,206 @@ async function runCheck() {
   await writeJson(HISTORY_PATH, history);
   await writeJson(STATE_PATH, state);
   await publish();
+  queueMonitorHistoryBackfill(snapshot.resources || [], checkedAt, {
+    force: forceBackfill,
+    previousLastRun
+  });
   return snapshot;
 }
 
+function queueMonitorHistoryBackfill(resources = [], checkedAt, options = {}) {
+  void (async () => {
+    const result = await maybeBackfillMonitorHistory(resources, checkedAt, options);
+    if (!result?.attempted) return;
+    if (state.latest?.checkedAt === checkedAt) {
+      state.latest.metrics ||= {};
+      state.latest.metrics.historyBackfill = {
+        ok: result.ok,
+        points: result.points,
+        resources: result.resources,
+        error: result.error || null
+      };
+    }
+    await writeJson(HISTORY_PATH, history);
+    await writeJson(STATE_PATH, state);
+    await publish();
+  })().catch((error) => {
+    console.error(`历史流量后台补采失败: ${error.message}`);
+  });
+}
+
+async function maybeBackfillMonitorHistory(resources = [], checkedAt, { force = false, previousLastRun = null } = {}) {
+  const options = normalizeHistoryBackfillOptions(config.historyBackfill);
+  const shouldBackfill = shouldBackfillOnStartupOrGap(options, checkedAt, previousLastRun);
+  const attempted = force || shouldBackfill;
+  if (!attempted) {
+    if (startupBackfillPending) startupBackfillPending = false;
+    return { attempted: false };
+  }
+  startupBackfillPending = false;
+  if (!options.enabled || backfillRunning || !process.env.MONITOR_COOKIE || !resources.length) {
+    return { attempted: true, ok: false, points: 0, resources: 0, error: "历史补采条件不足" };
+  }
+
+  backfillRunning = true;
+  try {
+    const endTime = new Date(checkedAt);
+    const startTime = new Date(endTime.getTime() - options.days * 24 * 60 * 60 * 1000);
+    const result = await buildMonitorBackfillSnapshot(resources, startTime, endTime, options);
+    if (!result.snapshot || !result.points) {
+      return { attempted: true, ok: false, points: 0, resources: 0, error: "最近 7 天没有可补采流量数据" };
+    }
+    history = mergeBackfillSnapshot(history, result.snapshot);
+    state.historyBackfill = {
+      tag: HISTORY_BACKFILL_TAG,
+      startAt: startTime.toISOString(),
+      endAt: endTime.toISOString(),
+      checkedAt,
+      days: options.days,
+      points: result.points,
+      resources: result.resources
+    };
+    return { attempted: true, ok: true, points: result.points, resources: result.resources };
+  } catch (error) {
+    state.historyBackfill = {
+      ...(state.historyBackfill || {}),
+      checkedAt,
+      error: error.message || "历史补采失败"
+    };
+    return { attempted: true, ok: false, points: 0, resources: 0, error: error.message || "历史补采失败" };
+  } finally {
+    backfillRunning = false;
+  }
+}
+
+function shouldBackfillOnStartupOrGap(options, checkedAt, previousLastRun) {
+  if (!options.enabled || !startupBackfillPending) return false;
+  if (!previousLastRun) return true;
+  const gapMs = Date.parse(checkedAt) - Date.parse(previousLastRun);
+  return !Number.isFinite(gapMs) || gapMs >= options.startupGapMinutes * 60 * 1000;
+}
+
+async function buildMonitorBackfillSnapshot(resources, startTime, endTime, options) {
+  const backfilledResources = [];
+  let pointCount = 0;
+
+  await Promise.all(resources.map(async (resource) => {
+    try {
+      const series = await fetchResourceMonitorSeries(resource.uuid, startTime, endTime, {
+        ...config.monitorSeries,
+        maxPoints: options.maxPointsPerNode
+      });
+      if (!series.length) return;
+      const normalizedSeries = normalizeBackfillSeries(series, startTime, endTime);
+      if (!normalizedSeries.length) return;
+      const latestPoint = normalizedSeries[normalizedSeries.length - 1];
+      pointCount += normalizedSeries.length;
+      backfilledResources.push({
+        ...resource,
+        currentFlowMbps: latestPoint.flowMbps,
+        currentFlowLabel: formatMbps(latestPoint.flowMbps),
+        bandwidthUsagePercent: percent(latestPoint.flowMbps, resource.bandwidthMbps),
+        flowSeries: normalizedSeries,
+        historyBackfilled: true
+      });
+    } catch (error) {
+      backfilledResources.push({
+        ...resource,
+        monitorError: error.message || "历史流量补采失败",
+        historyBackfilled: true
+      });
+    }
+  }));
+
+  if (!pointCount) return { snapshot: null, points: 0, resources: 0 };
+
+  const resourceSummary = summarizeResources(backfilledResources);
+  return {
+    points: pointCount,
+    resources: backfilledResources.filter((resource) => Array.isArray(resource.flowSeries) && resource.flowSeries.length).length,
+    snapshot: {
+      ok: true,
+      checkedAt: startTime.toISOString(),
+      target: { name: "历史流量补采", url: config.target.url },
+      metrics: {
+        historyBackfilled: true,
+        historyBackfillTag: HISTORY_BACKFILL_TAG,
+        historyBackfillStartAt: startTime.toISOString(),
+        historyBackfillEndAt: endTime.toISOString(),
+        historyBackfillDays: options.days,
+        historyBackfillPoints: pointCount,
+        resourceFetched: backfilledResources.length,
+        resourceDisplayed: backfilledResources.length,
+        totalFlowMbps: resourceSummary.totalFlowMbps,
+        totalBandwidthMbps: resourceSummary.totalBandwidthMbps,
+        bandwidthUsagePercent: resourceSummary.bandwidthUsagePercent
+      },
+      resources: backfilledResources,
+      alerts: [],
+      sample: "monitor history backfill",
+      historyBackfill: {
+        tag: HISTORY_BACKFILL_TAG,
+        startAt: startTime.toISOString(),
+        endAt: endTime.toISOString()
+      }
+    }
+  };
+}
+
+function normalizeBackfillSeries(series, startTime, endTime) {
+  const startMs = startTime.getTime();
+  const endMs = endTime.getTime();
+  const seen = new Set();
+  return series
+    .map((point) => {
+      const checkedAt = normalizeMonitorTime(point.checkedAt);
+      const timeMs = Date.parse(checkedAt);
+      if (!Number.isFinite(timeMs) || timeMs < startMs || timeMs > endMs) return null;
+      const key = new Date(timeMs).toISOString();
+      if (seen.has(key)) return null;
+      seen.add(key);
+      return {
+        checkedAt: key,
+        flowMbps: round(Number(point.flowMbps || 0), 2)
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => Date.parse(left.checkedAt) - Date.parse(right.checkedAt));
+}
+
+function mergeBackfillSnapshot(sourceHistory, backfillSnapshot) {
+  const next = [
+    backfillSnapshot,
+    ...sourceHistory.filter((snapshot) => snapshot?.historyBackfill?.tag !== HISTORY_BACKFILL_TAG)
+  ];
+  return trimHistory(next);
+}
+
+function trimHistory(items) {
+  const limit = Math.max(1, Number(config.schedule?.historyLimit || 100));
+  const backfillSnapshots = [];
+  const normalSnapshots = [];
+
+  for (const item of items.filter(Boolean)) {
+    if (item.historyBackfill?.tag === HISTORY_BACKFILL_TAG) backfillSnapshots.push(item);
+    else normalSnapshots.push(item);
+  }
+
+  const newestBackfill = backfillSnapshots
+    .sort((left, right) => Date.parse(right.historyBackfill?.endAt || right.checkedAt) - Date.parse(left.historyBackfill?.endAt || left.checkedAt))
+    .slice(0, 1);
+
+  return [
+    ...normalSnapshots
+      .sort((left, right) => Date.parse(right.checkedAt) - Date.parse(left.checkedAt))
+      .slice(0, limit),
+    ...newestBackfill
+  ].sort((left, right) => Date.parse(right.checkedAt) - Date.parse(left.checkedAt));
+}
+
 async function maybeSendAlert(rule, snapshot) {
-  if (!config.serverChan?.enabled) return;
+  const pushItem = rule.nodeUuid ? "nodeAlerts" : "systemAlerts";
+  if (!isServerChanPushEnabled(pushItem)) return;
   const cooldownMs = Math.max(0, Number(config.serverChan.cooldownSeconds || 0)) * 1000;
   const lastSent = state.lastEmailByRule?.[rule.id] || 0;
   if (Date.now() - lastSent < cooldownMs) return;
@@ -359,7 +1037,7 @@ function evaluateNodeAlerts(resources, checkedAt) {
         actual,
         thresholdPercent: threshold,
         severity: rule.severity || "warning",
-        message: `${resource.remark || resource.uuid} 在 ${rule.time} 流量占比低于 ${threshold}%`,
+        message: `${resource.remark || resource.uuid} · ${rule.time} 流量低于 ${threshold}%`,
         triggeredAt: checkedAt,
         nodeUuid: resource.uuid,
         nodeRemark: resource.remark || "",
@@ -574,6 +1252,39 @@ function round(value, digits = 2) {
   return Math.round(Number(value || 0) * factor) / factor;
 }
 
+function billingP95(values) {
+  const sorted = values
+    .map(Number)
+    .filter((value) => Number.isFinite(value) && value >= 0)
+    .sort((left, right) => right - left);
+  if (!sorted.length) return 0;
+  const dropCount = Math.floor(sorted.length * 0.05);
+  return sorted[Math.min(dropCount, sorted.length - 1)] || 0;
+}
+
+function average(values) {
+  const numbers = values.filter((value) => Number.isFinite(value) && value > 0);
+  if (!numbers.length) return 0;
+  return numbers.reduce((sum, value) => sum + value, 0) / numbers.length;
+}
+
+function weightedAverage(items) {
+  const valid = items.filter((item) => Number.isFinite(item.value) && item.value > 0 && Number.isFinite(item.weight) && item.weight > 0);
+  const weight = valid.reduce((sum, item) => sum + item.weight, 0);
+  if (!weight) return 0;
+  return valid.reduce((sum, item) => sum + item.value * item.weight, 0) / weight;
+}
+
+function normalizeForecastFlowScale(value, options = {}) {
+  const number = Number(value);
+  const min = Number(options.minFlowScale ?? 0.5);
+  const max = Number(options.maxFlowScale ?? 1.05);
+  const lower = Number.isFinite(min) ? min : 0.5;
+  const upper = Number.isFinite(max) ? max : 1.05;
+  if (!Number.isFinite(number) || number <= 0) return 1;
+  return round(Math.min(Math.max(number, lower), upper), 4);
+}
+
 function coerce(value, type) {
   if (type === "number") return Number(value ?? 0);
   if (type === "boolean") {
@@ -590,8 +1301,6 @@ function readPath(input, keyPath = "") {
 
 async function fetchTarget(target) {
   const started = Date.now();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Number(target.timeoutMs || 15000));
   const headers = {
     ...(target.headers || {}),
     ...(target.body ? { "Content-Type": "application/json" } : {}),
@@ -599,29 +1308,70 @@ async function fetchTarget(target) {
     ...(process.env.MONITOR_USER_AGENT ? { "User-Agent": process.env.MONITOR_USER_AGENT } : {})
   };
 
-  try {
-    const response = await fetch(target.url, {
-      method: target.method || "GET",
-      headers,
-      body: target.body ? JSON.stringify(target.body) : undefined,
-      signal: controller.signal,
-      redirect: "follow"
-    });
-    return {
-      statusCode: response.status,
-      headers: Object.fromEntries(response.headers.entries()),
-      body: await response.text(),
-      responseTimeMs: Date.now() - started
-    };
-  } finally {
-    clearTimeout(timeout);
+  const response = await fetchWithRetry(target.url, {
+    method: target.method || "GET",
+    headers,
+    body: target.body ? JSON.stringify(target.body) : undefined,
+    redirect: "follow"
+  }, {
+    timeoutMs: Number(target.timeoutMs || 15000),
+    label: target.name || "目标接口"
+  });
+  return {
+    statusCode: response.status,
+    headers: Object.fromEntries(response.headers.entries()),
+    body: await response.text(),
+    responseTimeMs: Date.now() - started
+  };
+}
+
+async function fetchWithRetry(url, options = {}, {
+  timeoutMs = 15000,
+  retries = 2,
+  retryDelayMs = 500,
+  label = "请求"
+} = {}) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, {
+        ...options,
+        signal: controller.signal
+      });
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retries) {
+        throw new Error(formatFetchFailure(error, label));
+      }
+      await delay(retryDelayMs * (attempt + 1));
+    } finally {
+      clearTimeout(timeout);
+    }
   }
+  throw new Error(formatFetchFailure(lastError, label));
+}
+
+function formatFetchFailure(error, label) {
+  if (error?.name === "AbortError") return `${label}超时`;
+  const cause = error?.cause;
+  const details = [
+    error?.message,
+    cause?.code,
+    cause?.message
+  ].filter(Boolean);
+  return `${label}失败${details.length ? `：${details.join(" / ")}` : ""}`;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function hydrateResourceMonitorSeries(resources, options = {}) {
   if (!options.enabled || !resources.length) return;
   const endTime = new Date();
-  const startTime = new Date(Date.now() - Math.max(5, Number(options.lookbackMinutes || 60)) * 60 * 1000);
+  const startTime = new Date(Date.now() - Math.max(5, Number(options.lookbackMinutes || 1440)) * 60 * 1000);
   await Promise.all(resources.map(async (resource) => {
     try {
       const series = await fetchResourceMonitorSeries(resource.uuid, startTime, endTime, options);
@@ -640,19 +1390,23 @@ async function fetchResourceMonitorSeries(uuid, startTime, endTime, options = {}
   const url = new URL(`https://cloud.tingyutech.com/api/jusha/machine/monitor/${encodeURIComponent(uuid)}`);
   url.searchParams.set("startTime", startTime.toISOString());
   url.searchParams.set("endTime", endTime.toISOString());
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     headers: {
       "Accept": "application/json,text/plain,*/*",
-      "Referer": "https://cloud.tingyutech.com/jusha/resource/all",
+      "Referer": `https://cloud.tingyutech.com/jusha/resource/all/detail/${encodeURIComponent(uuid)}`,
       ...(process.env.MONITOR_COOKIE ? { Cookie: process.env.MONITOR_COOKIE } : {}),
       ...(process.env.MONITOR_USER_AGENT ? { "User-Agent": process.env.MONITOR_USER_AGENT } : {})
     }
+  }, {
+    timeoutMs: Number(config.target?.timeoutMs || 15000),
+    retries: 1,
+    label: "流量曲线接口"
   });
   const payload = await response.json();
   if (!response.ok || payload.success === false) {
     throw new Error(payload.message || `monitor api ${response.status}`);
   }
-  return normalizeMonitorSeries(payload.data ?? payload, Number(options.maxPoints || 30));
+  return normalizeMonitorSeries(payload.data ?? payload, Number(options.maxPoints || 288));
 }
 
 function normalizeMonitorSeries(payload, maxPoints) {
@@ -696,11 +1450,28 @@ function toFlowSeries(items) {
       ]);
       if (flow === null) return null;
       return {
-        checkedAt: String(readFirstValue(item, ["createTime", "time", "timestamp", "date", "createdAt", "reportCreateTime"]) ?? index),
+        checkedAt: normalizeMonitorTime(readFirstValue(item, ["createTime", "time", "timestamp", "date", "createdAt", "reportCreateTime"]) ?? index),
         flowMbps: round(flow, 2)
       };
     })
     .filter(Boolean);
+}
+
+function normalizeMonitorTime(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString();
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const millis = value > 10_000_000_000 ? value : value * 1000;
+    return new Date(millis).toISOString();
+  }
+  const text = String(value ?? "").trim();
+  if (/^\d{10}$/.test(text)) return new Date(Number(text) * 1000).toISOString();
+  if (/^\d{13}$/.test(text)) return new Date(Number(text)).toISOString();
+  const normalized = text.includes(" ") && !/[zZ]|[+-]\d{2}:?\d{2}$/.test(text)
+    ? `${text.replace(" ", "T")}+08:00`
+    : text;
+  const date = new Date(normalized);
+  if (!Number.isNaN(date.getTime())) return date.toISOString();
+  return text;
 }
 
 function readFirstNumber(item, keys) {
@@ -768,7 +1539,7 @@ async function sendAlertEmail({ rule, metricValue, snapshot }, force = false) {
   const smtp = readSmtpEnv();
   if (!force && !config.email?.enabled) return;
   if (!smtp.host || !smtp.from || !smtp.to) {
-    throw new Error("SMTP 未配置完整，请检查 .env.example 中的 SMTP_HOST、ALERT_FROM、ALERT_TO");
+    throw new Error("SMTP 配置不完整，请检查 .env.example 中的 SMTP_HOST、ALERT_FROM、ALERT_TO");
   }
 
   const subject = `${config.email?.subjectPrefix || "[报警]"} ${rule.message}`;
@@ -795,15 +1566,19 @@ async function sendAlertEmail({ rule, metricValue, snapshot }, force = false) {
 
 async function sendServerChanAlert({ rule, metricValue, snapshot }, force = false) {
   if (!force && !config.serverChan?.enabled) return;
+  const title = `${config.serverChan?.subjectPrefix || "[??]"} ${rule.message}`;
+  const desp = rule.nodeUuid
+    ? buildNodeServerChanMessage(rule, snapshot)
+    : buildGenericServerChanMessage(rule, metricValue, snapshot);
+
+  await postServerChanMessage(title, desp);
+}
+
+async function postServerChanMessage(title, desp) {
   const sendKey = process.env.SERVERCHAN_SENDKEY;
   if (!sendKey) {
     throw new Error("Server酱 SendKey 未配置");
   }
-
-  const title = `${config.serverChan?.subjectPrefix || "[报警]"} ${rule.message}`;
-  const desp = rule.nodeUuid
-    ? buildNodeServerChanMessage(rule, snapshot)
-    : buildGenericServerChanMessage(rule, metricValue, snapshot);
 
   const url = `https://sctapi.ftqq.com/${encodeURIComponent(sendKey)}.send`;
   const response = await fetch(url, {
@@ -823,16 +1598,16 @@ function buildNodeServerChanMessage(rule, snapshot) {
   const currentFlow = rule.currentFlowLabel || formatMbps(rule.currentFlowMbps || 0);
   const ruleText = formatNodeAlertRule(rule);
   return [
-    `### 聚沙节点报警`,
+    `### 聚沙报警`,
     "",
     `- 节点名称: ${rule.nodeRemark || rule.nodeUuid}`,
     `- 报警规则: ${ruleText}`,
     `- 目前流量: ${currentFlow}`,
     `- 当前占比: ${formatPercentText(rule.bandwidthUsagePercent ?? rule.actual)}%`,
-    `- 报警时间: ${snapshot.checkedAt}`,
+    `- 触发时间: ${snapshot.checkedAt}`,
     `- UUID: ${rule.nodeUuid}`,
     "",
-    `原始消息: ${rule.message}`
+    `报警内容: ${rule.message}`
   ].join("\n");
 }
 
@@ -855,7 +1630,7 @@ function buildGenericServerChanMessage(rule, metricValue, snapshot) {
 
 function formatNodeAlertRule(rule) {
   if (rule.type === "time_percent_below") {
-    return `${rule.time || "--:--"} 流量占比低于 ${formatPercentText(rule.thresholdPercent)}%`;
+    return `${rule.time || "--:--"} 流量低于 ${formatPercentText(rule.thresholdPercent)}%`;
   }
   return rule.message || rule.ruleId || rule.id;
 }
@@ -864,6 +1639,18 @@ function formatPercentText(value) {
   const number = Number(value || 0);
   if (!Number.isFinite(number)) return "0";
   return number.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+}
+
+function formatCurrencyText(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return "0.00";
+  return number.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function formatGbText(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return "0 G";
+  return `${number.toLocaleString("zh-CN", { maximumFractionDigits: 3 })} G`;
 }
 
 function readSmtpEnv() {
@@ -1001,6 +1788,8 @@ function getPublicState() {
     config,
     history,
     nodeSettings,
+    income: incomeState,
+    forecast: forecastState,
     serverChanSettings: getPublicServerChanSettings(),
     auth: {
       hasCookie: Boolean(process.env.MONITOR_COOKIE),
@@ -1030,6 +1819,7 @@ function getPublicServerChanSettings() {
     enabled: Boolean(config.serverChan?.enabled),
     cooldownSeconds: Number(config.serverChan?.cooldownSeconds || 0),
     subjectPrefix: config.serverChan?.subjectPrefix || "[Resource Monitor Alert]",
+    pushItems: normalizeServerChanPushItems(config.serverChan?.pushItems),
     hasSendKey: Boolean(process.env.SERVERCHAN_SENDKEY),
     sendKeyPreview: maskSecret(process.env.SERVERCHAN_SENDKEY || "")
   };
@@ -1096,6 +1886,16 @@ async function persistNodeSettings() {
   await writeJson(NODE_SETTINGS_PATH, nodeSettings);
 }
 
+async function persistIncomeState() {
+  incomeState = normalizeIncomeState(incomeState);
+  await writeJson(INCOME_PATH, incomeState);
+}
+
+async function persistForecastState() {
+  forecastState = normalizeForecastState(forecastState);
+  await writeJson(FORECAST_PATH, forecastState);
+}
+
 async function readBodyJson(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -1107,6 +1907,74 @@ function validateConfig(next) {
   new URL(next.target.url);
   if (!Array.isArray(next.extractors)) throw new Error("extractors must be an array");
   if (!Array.isArray(next.rules)) throw new Error("rules must be an array");
+}
+
+function normalizeConfig(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  const income = source.income && typeof source.income === "object" ? source.income : {};
+  const retryIntervalMinutes = Number(income.retryIntervalMinutes ?? 15);
+  const billType = Number(income.billType ?? 0);
+  const taxRate = normalizeTaxRate(income.taxRate ?? income.tax ?? 0.06);
+  const monthlyFixedExpenseYuan = normalizeMoneyYuan(income.monthlyFixedExpenseYuan ?? income.fixedExpenseYuan ?? 0);
+
+  return {
+    ...source,
+    income: {
+      enabled: income.enabled !== false,
+      startTime: normalizeHm(income.startTime) || "06:30",
+      retryIntervalMinutes: Number.isFinite(retryIntervalMinutes) ? Math.max(1, retryIntervalMinutes) : 15,
+      billType: Number.isFinite(billType) ? billType : 0,
+      taxRate,
+      monthlyFixedExpenseYuan
+    },
+    monitorSeries: normalizeMonitorSeriesOptions(source.monitorSeries),
+    historyBackfill: normalizeHistoryBackfillOptions(source.historyBackfill),
+    incomeForecast: normalizeIncomeForecastOptions(source.incomeForecast),
+    serverChan: normalizeServerChanConfig(source.serverChan)
+  };
+}
+
+function normalizeMonitorSeriesOptions(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  const lookbackMinutes = Number(source.lookbackMinutes ?? 1440);
+  const maxPoints = Number(source.maxPoints ?? 288);
+  return {
+    ...source,
+    enabled: source.enabled !== false,
+    lookbackMinutes: Number.isFinite(lookbackMinutes)
+      ? Math.min(7 * 24 * 60, Math.max(5, Math.round(lookbackMinutes)))
+      : 1440,
+    maxPoints: Number.isFinite(maxPoints)
+      ? Math.min(5000, Math.max(1, Math.round(maxPoints)))
+      : 288
+  };
+}
+
+function normalizeServerChanConfig(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  const cooldownSeconds = Number(source.cooldownSeconds ?? 600);
+  return {
+    ...source,
+    enabled: source.enabled !== false,
+    cooldownSeconds: Number.isFinite(cooldownSeconds) ? Math.max(0, cooldownSeconds) : 600,
+    subjectPrefix: String(source.subjectPrefix || "[聚沙]"),
+    pushItems: normalizeServerChanPushItems(source.pushItems)
+  };
+}
+
+function normalizeServerChanPushItems(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    systemAlerts: source.systemAlerts !== false,
+    nodeAlerts: source.nodeAlerts !== false,
+    incomeSummary: source.incomeSummary !== false
+  };
+}
+
+function isServerChanPushEnabled(key) {
+  if (!config.serverChan?.enabled) return false;
+  const pushItems = normalizeServerChanPushItems(config.serverChan?.pushItems);
+  return pushItems[key] !== false;
 }
 
 function sendJson(res, payload, status = 200) {
@@ -1172,6 +2040,231 @@ function normalizeNodeSettings(value = {}) {
   return { hiddenNodeUuids, nodeOrderUuids, nodeAlerts, nodeAlertMutes, nodeMonitors };
 }
 
+function normalizeIncomeState(value = {}) {
+  const items = Array.isArray(value.items)
+    ? value.items.map((item) => normalizeStoredIncomeItem(item)).filter((item) => item.uuid)
+    : [];
+  const month = normalizeIncomeMonth(value.month);
+  return {
+    date: value.date || value.targetDate || null,
+    targetDate: value.targetDate || value.date || null,
+    ready: Boolean(value.ready),
+    status: value.status || (items.length ? "ready" : "idle"),
+    lastCheckedAt: value.lastCheckedAt || null,
+    nextCheckAt: value.nextCheckAt || null,
+    error: value.error || null,
+    items,
+    summary: summarizeIncomeItems(items),
+    month,
+    notification: normalizeIncomeNotification(value.notification)
+  };
+}
+
+function normalizeIncomeMonth(value = null) {
+  if (!value || typeof value !== "object") return null;
+  const taxRate = normalizeTaxRate(value.taxRate ?? config.income?.taxRate ?? 0.06);
+  const monthlyFixedExpenseYuan = normalizeMoneyYuan(
+    value.monthlyFixedExpenseYuan ?? value.fixedExpenseYuan ?? config.income?.monthlyFixedExpenseYuan ?? 0
+  );
+  const monthlyFixedExpenseCents = Math.round(monthlyFixedExpenseYuan * 100);
+  const totalIncomeCents = Number.isFinite(Number(value.totalIncomeCents))
+    ? Math.round(Number(value.totalIncomeCents))
+    : Math.round(Number(value.totalIncomeYuan || value.grossIncomeYuan || 0) * 100);
+  const taxCents = Number.isFinite(Number(value.taxCents))
+    ? Math.round(Number(value.taxCents))
+    : Math.round(totalIncomeCents * taxRate);
+  const netIncomeCents = Number.isFinite(Number(value.netIncomeCents))
+    ? Math.round(Number(value.netIncomeCents))
+    : Math.max(0, totalIncomeCents - taxCents);
+  const netProfitCents = netIncomeCents - monthlyFixedExpenseCents;
+
+  return {
+    month: value.month || String(value.endDate || value.date || "").slice(0, 7) || null,
+    startDate: value.startDate || null,
+    endDate: value.endDate || null,
+    checkedDays: Math.max(0, Number(value.checkedDays || 0)),
+    settlementDays: Math.max(0, Number(value.settlementDays || 0)),
+    count: Math.max(0, Number(value.count || 0)),
+    totalFlowGb: round(Number(value.totalFlowGb || 0), 3),
+    totalIncomeCents,
+    totalIncomeYuan: round(totalIncomeCents / 100, 2),
+    taxRate,
+    taxCents,
+    taxYuan: round(taxCents / 100, 2),
+    netIncomeCents,
+    netIncomeYuan: round(netIncomeCents / 100, 2),
+    monthlyFixedExpenseCents,
+    monthlyFixedExpenseYuan,
+    netProfitCents,
+    netProfitYuan: round(netProfitCents / 100, 2),
+    failedDates: Array.isArray(value.failedDates)
+      ? value.failedDates.map((item) => ({
+        date: String(item.date || ""),
+        error: String(item.error || "")
+      })).filter((item) => item.date)
+      : []
+  };
+}
+
+function normalizeTaxRate(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0.06;
+  if (number > 1) return Math.min(1, Math.max(0, number / 100));
+  return Math.min(1, Math.max(0, number));
+}
+
+function normalizeMoneyYuan(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return round(Math.max(0, number), 2);
+}
+
+function normalizeIncomeNotification(value = {}) {
+  return {
+    date: value?.date || null,
+    sentAt: value?.sentAt || null,
+    failedAt: value?.failedAt || null,
+    error: value?.error || null
+  };
+}
+
+function normalizeForecastState(value = {}) {
+  const items = {};
+  for (const [uuid, item] of Object.entries(value.items || {})) {
+    const normalized = normalizeForecastItem(item);
+    if (normalized) items[uuid] = normalized;
+  }
+  return {
+    version: Number(value.version || 0),
+    date: value.date || null,
+    updatedAt: value.updatedAt || null,
+    items,
+    history: normalizeForecastHistory(value.history)
+  };
+}
+
+function normalizeForecastItem(item = {}) {
+  if (!item || typeof item !== "object") return null;
+  return {
+    date: item.date || null,
+    status: item.status || "ready",
+    updatedAt: item.updatedAt || null,
+    estimatedIncomeYuan: round(Number(item.estimatedIncomeYuan || 0), 2),
+    estimatedSettlementFlowGb: round(Number(item.estimatedSettlementFlowGb || 0), 3),
+    rawEstimatedSettlementFlowGb: round(Number(item.rawEstimatedSettlementFlowGb || item.todayP95FlowGb || 0), 3),
+    todayP95Mbps: round(Number(item.todayP95Mbps || 0), 2),
+    todayP95FlowGb: round(Number(item.todayP95FlowGb || 0), 3),
+    unitPriceYuanPerGb: round(Number(item.unitPriceYuanPerGb || 0), 2),
+    flowScale: round(Number(item.flowScale || 1), 4),
+    rawFlowScale: round(Number(item.rawFlowScale || item.flowScale || 1), 4),
+    forecastAccuracyScale: round(Number(item.forecastAccuracyScale || 0), 4),
+    sampleCount: Math.max(0, Number(item.sampleCount || 0)),
+    forecastSampleCount: Math.max(0, Number(item.forecastSampleCount || 0)),
+    monitorSampleCount: Math.max(0, Number(item.monitorSampleCount || 0)),
+    fallbackPriceCount: Math.max(0, Number(item.fallbackPriceCount || 0)),
+    historyDates: Array.isArray(item.historyDates) ? item.historyDates.map(String) : [],
+    adjustmentDates: Array.isArray(item.adjustmentDates) ? item.adjustmentDates.map(String) : [],
+    pointCount: Math.max(0, Number(item.pointCount || 0)),
+    error: item.error || null
+  };
+}
+
+function normalizeForecastHistory(value = {}) {
+  const history = {};
+  for (const [date, items] of Object.entries(value || {})) {
+    const normalizedItems = {};
+    for (const [uuid, item] of Object.entries(items || {})) {
+      const normalized = normalizeForecastItem(item);
+      if (normalized) normalizedItems[uuid] = normalized;
+    }
+    if (Object.keys(normalizedItems).length) history[date] = normalizedItems;
+  }
+  return history;
+}
+
+function mergeForecastHistory(sourceHistory = {}, date, items = {}) {
+  const next = normalizeForecastHistory(sourceHistory);
+  const normalizedItems = {};
+  for (const [uuid, item] of Object.entries(items || {})) {
+    const normalized = normalizeForecastItem(item);
+    if (normalized) normalizedItems[uuid] = normalized;
+  }
+  if (date && Object.keys(normalizedItems).length) next[date] = normalizedItems;
+  const entries = Object.entries(next)
+    .sort(([left], [right]) => right.localeCompare(left))
+    .slice(0, 14);
+  return Object.fromEntries(entries);
+}
+
+function getHistoricalForecast(uuid, date) {
+  if (forecastState.date === date && forecastState.items?.[uuid]) return forecastState.items[uuid];
+  return forecastState.history?.[date]?.[uuid] || null;
+}
+
+function readForecastRawFlowGb(item) {
+  const value = Number(item?.rawEstimatedSettlementFlowGb || item?.todayP95FlowGb || 0);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function normalizeHistoryBackfillOptions(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  const days = Number(source.days ?? 7);
+  const maxPointsPerNode = Number(source.maxPointsPerNode ?? 2500);
+  const startupGapMinutes = Number(source.startupGapMinutes ?? 10);
+  return {
+    enabled: source.enabled !== false,
+    days: Number.isFinite(days) ? Math.min(14, Math.max(1, Math.round(days))) : 7,
+    maxPointsPerNode: Number.isFinite(maxPointsPerNode) ? Math.min(5000, Math.max(96, Math.round(maxPointsPerNode))) : 2500,
+    startupGapMinutes: Number.isFinite(startupGapMinutes) ? Math.max(1, startupGapMinutes) : 10
+  };
+}
+
+function normalizeIncomeForecastOptions(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  const historyDays = Number(source.historyDays ?? 5);
+  const refreshMinutes = Number(source.refreshMinutes ?? 30);
+  const maxMonitorPoints = Number(source.maxMonitorPoints ?? 500);
+  const minFlowScale = Number(source.minFlowScale ?? 0.5);
+  const maxFlowScale = Number(source.maxFlowScale ?? 1.05);
+  return {
+    enabled: source.enabled !== false,
+    historyDays: Number.isFinite(historyDays) ? Math.min(14, Math.max(1, Math.round(historyDays))) : 5,
+    refreshMinutes: Number.isFinite(refreshMinutes) ? Math.max(5, refreshMinutes) : 30,
+    maxMonitorPoints: Number.isFinite(maxMonitorPoints) ? Math.min(1200, Math.max(96, Math.round(maxMonitorPoints))) : 500,
+    minFlowScale: Number.isFinite(minFlowScale) ? Math.min(1, Math.max(0.1, minFlowScale)) : 0.5,
+    maxFlowScale: Number.isFinite(maxFlowScale) ? Math.min(1.5, Math.max(0.5, maxFlowScale)) : 1.05
+  };
+}
+
+function normalizeStoredIncomeItem(item = {}) {
+  const incomeCents = Number.isFinite(Number(item.incomeCents))
+    ? Math.round(Number(item.incomeCents))
+    : Math.round(Number(item.incomeYuan || 0) * 100);
+  const incomeYuan = Number.isFinite(Number(item.incomeYuan))
+    ? round(Number(item.incomeYuan), 2)
+    : round(incomeCents / 100, 2);
+  const date = String(item.date || "");
+  const flowGb = round(Number(item.flowGb || 0), 3);
+  const unitPriceYuanPerMonth = flowGb > 0
+    ? calculateMonthlyUnitPrice(incomeYuan, flowGb, date)
+    : round(Number(item.unitPriceYuanPerMonth || 0), 2);
+
+  return {
+    date,
+    uuid: String(item.uuid || ""),
+    host: String(item.host || ""),
+    remark: String(item.remark || ""),
+    subUsername: String(item.subUsername || ""),
+    serviceId: item.serviceId ?? null,
+    billType: item.billType ?? null,
+    groupType: item.groupType ?? null,
+    flowGb,
+    incomeCents,
+    incomeYuan,
+    unitPriceYuanPerMonth
+  };
+}
+
 function normalizeNodeMonitorSetting(monitor) {
   if (!monitor || typeof monitor !== "object") return null;
   const startTime = normalizeHm(monitor.startTime);
@@ -1215,6 +2308,53 @@ function normalizeHm(value) {
   const minute = Number(match[2]);
   if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return "";
   return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function hmToMinutes(value) {
+  const normalized = normalizeHm(value);
+  if (!normalized) return null;
+  const [hour, minute] = normalized.split(":").map(Number);
+  return hour * 60 + minute;
+}
+
+function getYesterdayDateKey(now) {
+  return formatShanghaiDate(new Date(new Date(now).getTime() - 24 * 60 * 60 * 1000));
+}
+
+function getPreviousDateKeys(now, count) {
+  const keys = [];
+  const base = new Date(now);
+  for (let offset = 1; offset <= count; offset += 1) {
+    keys.push(formatShanghaiDate(new Date(base.getTime() - offset * 24 * 60 * 60 * 1000)));
+  }
+  return keys;
+}
+
+function getMonthDateKeys(targetDate) {
+  const [year, month, day] = String(targetDate || "").split("-").map(Number);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return [];
+  const days = Math.min(day, daysInMonth(targetDate));
+  const keys = [];
+  for (let current = 1; current <= days; current += 1) {
+    keys.push(`${year}-${String(month).padStart(2, "0")}-${String(current).padStart(2, "0")}`);
+  }
+  return keys;
+}
+
+function getShanghaiDayRange(dateKey, end = null) {
+  const start = new Date(`${dateKey}T00:00:00+08:00`);
+  const next = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  const requestedEnd = end ? new Date(end) : next;
+  return {
+    start,
+    end: requestedEnd < next ? requestedEnd : next
+  };
+}
+
+function daysInMonth(dateKey) {
+  const [year, month] = String(dateKey || "").split("-").map(Number);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) return 30;
+  return new Date(year, month, 0).getDate();
 }
 
 function formatShanghaiMinute(value) {

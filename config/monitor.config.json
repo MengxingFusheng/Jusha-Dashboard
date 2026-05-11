@@ -23,8 +23,30 @@
   },
   "monitorSeries": {
     "enabled": true,
-    "lookbackMinutes": 60,
-    "maxPoints": 30
+    "lookbackMinutes": 1440,
+    "maxPoints": 288
+  },
+  "historyBackfill": {
+    "enabled": true,
+    "days": 7,
+    "maxPointsPerNode": 2500,
+    "startupGapMinutes": 10
+  },
+  "income": {
+    "enabled": true,
+    "startTime": "06:30",
+    "retryIntervalMinutes": 15,
+    "billType": 0,
+    "taxRate": 0.06,
+    "monthlyFixedExpenseYuan": 0
+  },
+  "incomeForecast": {
+    "enabled": true,
+    "historyDays": 5,
+    "refreshMinutes": 30,
+    "maxMonitorPoints": 500,
+    "minFlowScale": 0.5,
+    "maxFlowScale": 1.05
   },
   "extractors": [
     {
@@ -93,6 +115,11 @@
   "serverChan": {
     "enabled": true,
     "cooldownSeconds": 600,
-    "subjectPrefix": "[聚沙报警]"
+    "subjectPrefix": "[聚沙]",
+    "pushItems": {
+      "systemAlerts": true,
+      "nodeAlerts": true,
+      "incomeSummary": true
+    }
   }
 }

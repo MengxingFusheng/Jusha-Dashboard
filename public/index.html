@@ -49,10 +49,42 @@
           <div class="panel-title-block">
             <h2>节点流量监控</h2>
             <span id="resourceCount" class="badge muted">0 条</span>
+            <label class="tile-scale-control" title="调整节点磁贴大小">
+              <span>大小</span>
+              <input id="resourceTileScale" type="range" min="0.85" max="1.3" step="0.05" value="1" aria-label="节点磁贴大小">
+              <output id="resourceTileScaleValue">100%</output>
+            </label>
           </div>
           <div id="hiddenMenu" class="hidden-menu"></div>
         </div>
         <div id="resources" class="resource-tiles"></div>
+      </section>
+
+      <section class="panel income-panel">
+        <div class="panel-head">
+          <div class="panel-title-block">
+            <h2>收益</h2>
+            <span id="incomeBadge" class="badge muted">收益未读取</span>
+            <label class="tile-scale-control" title="调整收益磁贴大小">
+              <span>大小</span>
+              <input id="incomeTileScale" type="range" min="0.85" max="1.3" step="0.05" value="1" aria-label="收益磁贴大小">
+              <output id="incomeTileScaleValue">100%</output>
+            </label>
+          </div>
+          <div class="actions compact">
+            <label class="income-header-expense">
+              <span>每月固定支出</span>
+              <div class="income-expense-input compact">
+                <span>¥</span>
+                <input id="monthlyFixedExpenseYuan" type="number" min="0" step="0.01" inputmode="decimal" value="0" aria-label="每月固定支出">
+                <button type="button" class="expense-save-button" data-action="save-fixed-expense">保存</button>
+              </div>
+            </label>
+            <button id="incomeCheckNow" type="button">检查收益</button>
+          </div>
+        </div>
+        <div id="incomeSummary" class="income-summary"></div>
+        <div id="incomeTiles" class="income-tiles"></div>
       </section>
 
       <section class="workspace">
@@ -98,9 +130,41 @@
               <span>启用 Server酱报警</span>
               <input id="serverChanEnabled" type="checkbox">
             </label>
+            <fieldset class="push-options">
+              <legend>可推送项目</legend>
+              <div class="push-card-grid">
+                <label class="push-card">
+                  <input type="checkbox" data-serverchan-push-item="nodeAlerts">
+                  <span class="push-card-icon" aria-hidden="true">流</span>
+                  <span class="push-card-copy">
+                    <strong>节点流量报警</strong>
+                    <small>磁贴内设置的节点报警触发时推送</small>
+                  </span>
+                  <span class="push-card-switch" aria-hidden="true"></span>
+                </label>
+                <label class="push-card">
+                  <input type="checkbox" data-serverchan-push-item="incomeSummary">
+                  <span class="push-card-icon income" aria-hidden="true">收</span>
+                  <span class="push-card-copy">
+                    <strong>收益通知</strong>
+                    <small>每日收益、本月税后收益和净利润推送</small>
+                  </span>
+                  <span class="push-card-switch" aria-hidden="true"></span>
+                </label>
+                <label class="push-card">
+                  <input type="checkbox" data-serverchan-push-item="systemAlerts">
+                  <span class="push-card-icon system" aria-hidden="true">基</span>
+                  <span class="push-card-copy">
+                    <strong>基础监控报警</strong>
+                    <small>接口异常、资源为空等系统规则推送</small>
+                  </span>
+                  <span class="push-card-switch" aria-hidden="true"></span>
+                </label>
+              </div>
+            </fieldset>
             <label>
               <span>SendKey</span>
-              <input id="serverChanSendKey" type="password" autocomplete="new-password" placeholder="留空则保持已保存 SendKey">
+              <input id="serverChanSendKey" type="password" autocomplete="new-password" placeholder="填写或替换 SendKey">
             </label>
             <label>
               <span>推送标题前缀</span>
