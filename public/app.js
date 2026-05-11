@@ -8,7 +8,15 @@ const els = {
   clearAlertLogs: document.querySelector("#clearAlertLogs"),
   resources: document.querySelector("#resources"),
   resourceCount: document.querySelector("#resourceCount"),
+  resourceTileScale: document.querySelector("#resourceTileScale"),
+  resourceTileScaleValue: document.querySelector("#resourceTileScaleValue"),
   hiddenMenu: document.querySelector("#hiddenMenu"),
+  incomeBadge: document.querySelector("#incomeBadge"),
+  incomeSummary: document.querySelector("#incomeSummary"),
+  incomeTiles: document.querySelector("#incomeTiles"),
+  incomeTileScale: document.querySelector("#incomeTileScale"),
+  incomeTileScaleValue: document.querySelector("#incomeTileScaleValue"),
+  incomeCheckNow: document.querySelector("#incomeCheckNow"),
   saveMessage: document.querySelector("#saveMessage"),
   cookieBadge: document.querySelector("#cookieBadge"),
   loginForm: document.querySelector("#loginForm"),
@@ -46,10 +54,14 @@ const tileMonitorDrafts = new Map();
 const nodeChartHoverPoints = new Map();
 const dismissedNodeAlertIds = new Set(readDismissedNodeAlertIds());
 const dismissedAlertLogKeys = new Set(readDismissedAlertLogKeys());
+const TILE_SCALE_LIMITS = { min: 0.85, max: 1.3 };
 
-els.checkNow.addEventListener("click", () => runAction("/api/check", els.checkNow, "检查完成"));
+els.checkNow.addEventListener("click", () => runAction("/api/check", els.checkNow, "????"));
+els.incomeCheckNow.addEventListener("click", () => runAction("/api/income/check", els.incomeCheckNow, "???????"));
 els.intervalSeconds.addEventListener("change", saveSamplingInterval);
-els.testServerChan.addEventListener("click", () => runAction("/api/test-serverchan", els.testServerChan, "测试推送已提交", els.serverChanMessage));
+els.resourceTileScale?.addEventListener("input", () => setTileScale("resource", els.resourceTileScale.value));
+els.incomeTileScale?.addEventListener("input", () => setTileScale("income", els.incomeTileScale.value));
+els.testServerChan.addEventListener("click", () => runAction("/api/test-serverchan", els.testServerChan, "???????", els.serverChanMessage));
 els.loginForm.addEventListener("submit", loginAccount);
 els.resources.addEventListener("click", onResourceAction);
 els.resources.addEventListener("input", onTileAlertInput);
@@ -76,10 +88,12 @@ document.addEventListener("click", (event) => {
   if (!event.target.closest(".mute-menu-wrap")) closeMuteMenus();
 });
 
+initTileScaleControls();
+
 const events = new EventSource("/events");
 events.onmessage = (event) => render(JSON.parse(event.data));
 events.onerror = () => {
-  els.runStatus.textContent = "连接中断";
+  els.runStatus.textContent = "????";
   els.runStatus.className = "badge danger";
 };
 
@@ -87,36 +101,68 @@ fetch("/api/state")
   .then((res) => res.json())
   .then(render)
   .catch((error) => {
-    els.runStatus.textContent = "读取失败";
+    els.runStatus.textContent = "????";
     els.runStatus.className = "badge danger";
     els.saveMessage.textContent = error.message;
   });
 
 function render(payload) {
   latestPayload = payload;
-  const { state, config, history, auth, nodeSettings, serverChanSettings } = payload;
+  const { state, config, history, auth, nodeSettings, serverChanSettings, income } = payload;
   const latest = state.latest;
   const metrics = latest?.metrics || {};
   const resources = latest?.resources || [];
 
   ensureSelectedNode(resources, nodeSettings);
 
-  els.targetLabel.textContent = `${config.target.name} · ${config.target.url}`;
-  els.runStatus.textContent = latest?.ok ? "正常" : latest ? "异常" : "等待首检";
+  els.targetLabel.textContent = `${config.target.name} ? ${config.target.url}`;
+  els.runStatus.textContent = latest?.ok ? "??" : latest ? "??" : "????";
   els.runStatus.className = `badge ${latest?.ok ? "ok" : latest ? "danger" : "muted"}`;
-  els.lastRun.textContent = latest ? `最近检查 ${formatTime(latest.checkedAt)}` : "最近检查 -";
-  els.cookieBadge.textContent = auth?.hasCookie ? `Cookie 已保存 (${auth.cookieLength} 字符)` : "未保存 Cookie";
+  els.lastRun.textContent = latest ? `???? ${formatTime(latest.checkedAt)}` : "???? -";
+  els.cookieBadge.textContent = auth?.hasCookie ? `Cookie ??? (${auth.cookieLength} ??)` : "??? Cookie";
   els.cookieBadge.className = `badge ${auth?.hasCookie ? "ok" : "muted"}`;
-  els.serverChanBadge.textContent = config.serverChan?.enabled ? "推送已启用" : "推送未启用";
+  els.serverChanBadge.textContent = config.serverChan?.enabled ? "?????" : "?????";
   els.serverChanBadge.className = `badge ${config.serverChan?.enabled ? "ok" : "muted"}`;
   renderSamplingInterval(config);
 
   syncDismissedNodeAlerts(state.activeAlerts || []);
-  renderResources(resources, metrics, history || [], nodeSettings || {}, state.activeAlerts || []);
+  renderResources(resources, metrics, history || [], nodeSettings || {}, state.activeAlerts || [], income || {});
+  renderIncomePanel(income || {}, resources, nodeSettings || {});
   renderHiddenMenu(resources, nodeSettings);
   renderNodeAlertPanel(resources, nodeSettings);
   renderAlertLogs(state.activeAlerts || [], history || []);
   renderServerChanSettings(serverChanSettings || {});
+}
+
+function initTileScaleControls() {
+  setTileScale("resource", readTileScale("resource"), false);
+  setTileScale("income", readTileScale("income"), false);
+}
+
+function readTileScale(kind) {
+  const raw = localStorage.getItem(`${kind}TileScale`);
+  return clampTileScale(raw || 1);
+}
+
+function setTileScale(kind, value, persist = true) {
+  const scale = clampTileScale(value);
+  const minBase = kind === "resource" ? 320 : 280;
+  const root = document.documentElement;
+  root.style.setProperty(`--${kind}-tile-scale`, String(scale));
+  root.style.setProperty(`--${kind}-tile-min`, `${Math.round(minBase * scale)}px`);
+
+  const input = kind === "resource" ? els.resourceTileScale : els.incomeTileScale;
+  const output = kind === "resource" ? els.resourceTileScaleValue : els.incomeTileScaleValue;
+  if (input) input.value = String(scale);
+  if (output) output.textContent = `${Math.round(scale * 100)}%`;
+  if (persist) localStorage.setItem(`${kind}TileScale`, String(scale));
+}
+
+function clampTileScale(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 1;
+  const rounded = Math.round(number * 20) / 20;
+  return Math.min(TILE_SCALE_LIMITS.max, Math.max(TILE_SCALE_LIMITS.min, rounded));
 }
 
 function ensureSelectedNode(resources, nodeSettings = {}) {
@@ -127,57 +173,60 @@ function ensureSelectedNode(resources, nodeSettings = {}) {
   draftNodeAlerts = cloneAlerts(nodeSettings?.nodeAlerts?.[selectedNodeUuid] || []);
 }
 
-function renderResources(resources, metrics = {}, history = [], nodeSettings = {}, activeAlerts = []) {
+function renderResources(resources, metrics = {}, history = [], nodeSettings = {}, activeAlerts = [], income = {}) {
   const visibleResources = sortResources(resources.filter((item) => !isResourceHidden(item, nodeSettings)), nodeSettings);
   const manualHidden = new Set(nodeSettings.hiddenNodeUuids || []).size || Number(metrics.resourceManuallyHidden || 0);
-  els.resourceCount.textContent = `展示 ${visibleResources.length} 条 · 手动隐藏 ${manualHidden} 条 · 站点排除 ${Number(metrics.resourceHidden || 0)} 条`;
+  els.resourceCount.textContent = `?? ${visibleResources.length} ? ? ???? ${manualHidden} ? ? ???? ${Number(metrics.resourceHidden || 0)} ?`;
 
   const series = buildNodeSeries(history);
   const activeAlertsByNode = groupActiveAlertsByNode(activeAlerts);
+  const incomeByNode = buildIncomeMap(income);
   nodeChartHoverPoints.clear();
   els.resources.innerHTML = visibleResources.length ? visibleResources.map((item) => {
     const points = series.get(item.uuid) || [];
     const alertCount = (item.nodeAlerts || []).length;
     const activeNodeAlerts = activeAlertsByNode.get(item.uuid) || [];
+    const incomeItem = incomeByNode.get(item.uuid);
     const mute = getActiveNodeMute(item.uuid, nodeSettings);
     const muteActive = Boolean(mute);
     nodeChartHoverPoints.set(item.uuid, getNodeChartHoverPoints(points, item));
     return `
       <article class="resource-tile ${flippedTileUuid === item.uuid ? "is-flipped" : ""}" draggable="${flippedTileUuid === item.uuid ? "false" : "true"}" data-uuid="${escapeHtml(item.uuid)}">
-        ${activeNodeAlerts.length ? `
-          <button type="button" class="tile-alert-button" data-action="dismiss-node-alert" data-uuid="${escapeHtml(item.uuid)}" title="消除当前节点报警提示" aria-label="消除当前节点报警提示">
-            &#128276;
-            <span>${activeNodeAlerts.length}</span>
-          </button>
-        ` : ""}
-        <button type="button" class="tile-hide-button" data-action="hide-node" data-uuid="${escapeHtml(item.uuid)}" title="隐藏节点" aria-label="隐藏节点">×</button>
+        <button type="button" class="tile-hide-button" data-action="hide-node" data-uuid="${escapeHtml(item.uuid)}" title="????" aria-label="????">?</button>
         <div class="resource-tile-head">
           <div>
             <div class="node-title-row">
-              <span class="drag-handle" title="拖动排序">≡</span>
-              <strong>${escapeHtml(item.remark || "未命名节点")}</strong>
+              <span class="drag-handle" title="????">?</span>
+              <strong>${escapeHtml(item.remark || "?????")}</strong>
+              ${renderUnitPriceTag(incomeItem)}
             </div>
-            <button type="button" class="uuid-button" data-action="copy-uuid" data-uuid="${escapeHtml(item.uuid)}" title="复制真实 UUID">UUID</button>
+            <button type="button" class="uuid-button" data-action="copy-uuid" data-uuid="${escapeHtml(item.uuid)}" title="???? UUID">UUID</button>
           </div>
           <div class="tile-head-side">
             <span class="status-pill ${item.online === 0 ? "offline" : "online"}">${escapeHtml(item.statusLabel || item.status)}</span>
             <div class="tile-actions">
+              ${activeNodeAlerts.length ? `
+                <button type="button" class="tile-alert-button" data-action="dismiss-node-alert" data-uuid="${escapeHtml(item.uuid)}" title="??????????" aria-label="??????????">
+                  &#128276;
+                  <span>${activeNodeAlerts.length}</span>
+                </button>
+              ` : ""}
               <div class="mute-menu-wrap">
                 <button type="button" class="icon-button mute-button ${muteActive ? "active" : ""}" data-action="toggle-mute-menu" data-uuid="${escapeHtml(item.uuid)}" title="${escapeHtml(formatMuteTitle(mute))}" aria-label="${escapeHtml(formatMuteTitle(mute))}">
                   &#128277;
                 </button>
                 <div class="mute-menu" role="menu">
-                  <button type="button" class="mute-option" data-action="mute-alerts" data-duration="1h" data-uuid="${escapeHtml(item.uuid)}">禁用 1 小时</button>
-                  <button type="button" class="mute-option" data-action="mute-alerts" data-duration="24h" data-uuid="${escapeHtml(item.uuid)}">禁用 24 小时</button>
-                  <button type="button" class="mute-option" data-action="mute-alerts" data-duration="forever" data-uuid="${escapeHtml(item.uuid)}">永久禁用</button>
-                  ${muteActive ? `<button type="button" class="mute-option restore" data-action="mute-alerts" data-duration="none" data-uuid="${escapeHtml(item.uuid)}">解除禁用</button>` : ""}
+                  <button type="button" class="mute-option" data-action="mute-alerts" data-duration="1h" data-uuid="${escapeHtml(item.uuid)}">?? 1 ??</button>
+                  <button type="button" class="mute-option" data-action="mute-alerts" data-duration="24h" data-uuid="${escapeHtml(item.uuid)}">?? 24 ??</button>
+                  <button type="button" class="mute-option" data-action="mute-alerts" data-duration="forever" data-uuid="${escapeHtml(item.uuid)}">????</button>
+                  ${muteActive ? `<button type="button" class="mute-option restore" data-action="mute-alerts" data-duration="none" data-uuid="${escapeHtml(item.uuid)}">????</button>` : ""}
                 </div>
               </div>
-              <button type="button" class="icon-button monitor-button" data-action="configure-monitor" data-uuid="${escapeHtml(item.uuid)}" title="监控预期" aria-label="监控预期">
-                ◔
+              <button type="button" class="icon-button monitor-button" data-action="configure-monitor" data-uuid="${escapeHtml(item.uuid)}" title="????" aria-label="????">
+                ?
               </button>
-              <button type="button" class="icon-button gear-button" data-action="configure-alerts" data-uuid="${escapeHtml(item.uuid)}" title="报警设置" aria-label="报警设置">
-                ⚙
+              <button type="button" class="icon-button gear-button" data-action="configure-alerts" data-uuid="${escapeHtml(item.uuid)}" title="????" aria-label="????">
+                ?
                 ${alertCount ? `<span class="alert-count-badge">${alertCount}</span>` : ""}
               </button>
             </div>
@@ -187,8 +236,9 @@ function renderResources(resources, metrics = {}, history = [], nodeSettings = {
           <div><strong>${escapeHtml(formatNumber(item.currentFlowMbps))}<span>Mbps</span></strong></div>
           <div><strong>${escapeHtml(formatNumber(item.bandwidthUsagePercent))}<span>%</span></strong></div>
         </div>
+        ${renderTileIncome(incomeItem, income, item.incomeForecast)}
         <div class="node-chart-wrap">
-          <svg class="node-chart" viewBox="0 0 360 150" role="img" aria-label="${escapeHtml(item.remark || item.uuid || "节点")}流量曲线">
+          <svg class="node-chart" viewBox="0 0 360 150" role="img" aria-label="${escapeHtml(item.remark || item.uuid || "??")}????">
             ${renderNodeChart(points, item)}
           </svg>
           <div class="chart-tooltip" aria-hidden="true"></div>
@@ -198,7 +248,138 @@ function renderResources(resources, metrics = {}, history = [], nodeSettings = {
         </div>
       </article>
     `;
-  }).join("") : `<div class="empty-tile">当前没有可展示节点</div>`;
+  }).join("") : `<div class="empty-tile">?????????</div>`;
+}
+
+function renderTileIncome(item, income = {}, forecast = null) {
+  const forecastReady = forecast?.status === "ready";
+  return `
+    <div class="tile-income-strip">
+      <div>
+        <span>????</span>
+        <strong>${item ? `?${escapeHtml(formatCurrency(item.incomeYuan))}` : "-"}</strong>
+      </div>
+      <div>
+        <span>????</span>
+        <strong>${item ? escapeHtml(formatFlowGb(item.flowGb)) : "-"}</strong>
+      </div>
+      <div>
+        <span>????</span>
+        <strong>${forecastReady ? `?${escapeHtml(formatCurrency(forecast.estimatedIncomeYuan))}` : "-"}</strong>
+      </div>
+      <div>
+        <span>??95</span>
+        <strong>${forecastReady ? escapeHtml(formatFlowGb(forecast.estimatedSettlementFlowGb)) : "-"}</strong>
+      </div>
+    </div>
+  `;
+}
+
+function renderUnitPriceTag(item) {
+  const monthlyPrice = calculateMonthlyUnitPrice(item);
+  if (!monthlyPrice) return "";
+  return `<span class="node-unit-price">?${escapeHtml(formatCurrency(monthlyPrice))}/?</span>`;
+}
+
+function renderIncomePanel(income = {}, resources = [], nodeSettings = {}) {
+  const items = Array.isArray(income.items) ? income.items : [];
+  const summary = income.summary || {};
+  const month = income.month || null;
+  const monthTaxRate = Number(month?.taxRate ?? 0.06);
+  els.incomeBadge.textContent = getIncomeStatusText(income);
+  els.incomeBadge.className = `badge ${getIncomeStatusClass(income)}`;
+  els.incomeSummary.innerHTML = `
+    <div class="income-summary-card">
+      <span>??</span>
+      <strong>${escapeHtml(income.date || income.targetDate || "-")}</strong>
+    </div>
+    <div class="income-summary-card">
+      <span>?????</span>
+      <strong>?${escapeHtml(formatCurrency(summary.totalIncomeYuan))}</strong>
+    </div>
+    <div class="income-summary-card">
+      <span>?????</span>
+      <strong>${escapeHtml(formatFlowGb(summary.totalFlowGb))}</strong>
+    </div>
+    <div class="income-summary-card">
+      <span>??????</span>
+      <strong>${month ? `?${escapeHtml(formatCurrency(month.totalIncomeYuan))}` : "-"}</strong>
+    </div>
+    <div class="income-summary-card">
+      <span>??????(${escapeHtml(formatTaxRate(monthTaxRate))})</span>
+      <strong>${month ? `?${escapeHtml(formatCurrency(month.netIncomeYuan))}` : "-"}</strong>
+    </div>
+    <div class="income-summary-card">
+      <span>????</span>
+      <strong>${Number(summary.count || items.length)} ?</strong>
+    </div>
+  `;
+
+  const resourceByUuid = new Map(resources.map((item) => [item.uuid, item]));
+  const displayItems = items
+    .map((item) => ({ income: item, resource: resourceByUuid.get(item.uuid) }))
+    .sort((left, right) => {
+      const leftHidden = left.resource ? isResourceHidden(left.resource, nodeSettings) : false;
+      const rightHidden = right.resource ? isResourceHidden(right.resource, nodeSettings) : false;
+      if (leftHidden !== rightHidden) return leftHidden ? 1 : -1;
+      return String(left.income.remark || left.resource?.remark || left.income.uuid)
+        .localeCompare(String(right.income.remark || right.resource?.remark || right.income.uuid), "zh-CN");
+    });
+
+  if (!displayItems.length) {
+    const detail = income.error
+      ? `???????${income.error}`
+      : income.lastCheckedAt
+        ? `???? ${formatTime(income.lastCheckedAt)}???????????`
+        : "?????????";
+    els.incomeTiles.innerHTML = `<div class="empty-tile">${escapeHtml(detail)}</div>`;
+    return;
+  }
+
+  els.incomeTiles.innerHTML = displayItems.map(({ income: item, resource }) => {
+    const name = item.remark || resource?.remark || item.host || "?????";
+    const usage = formatSettlementUsage(item, resource);
+    const status = resource ? (resource.statusLabel || resource.status || "-") : "?????";
+    return `
+      <article class="income-tile">
+        <div class="income-tile-head">
+          <div>
+            <div class="income-name-row">
+              <strong>${escapeHtml(name)}</strong>
+              ${renderUnitPriceTag(item)}
+            </div>
+            <span>${escapeHtml(item.host || resource?.host || item.uuid)}</span>
+          </div>
+          <span class="status-pill ${resource?.online === 0 ? "offline" : "online"}">${escapeHtml(status)}</span>
+        </div>
+        <div class="income-metrics">
+          <div><span>??</span><strong>?${escapeHtml(formatCurrency(item.incomeYuan))}</strong></div>
+          <div><span>???</span><strong>${escapeHtml(usage)}</strong></div>
+          <div><span>????</span><strong>${escapeHtml(formatFlowGb(item.flowGb))}</strong></div>
+        </div>
+        <div class="income-uuid">${escapeHtml(item.uuid)}</div>
+      </article>
+    `;
+  }).join("");
+}
+
+function buildIncomeMap(income = {}) {
+  return new Map((income.items || []).map((item) => [item.uuid, item]));
+}
+
+function getIncomeStatusText(income = {}) {
+  if (income.status === "ready" || income.ready) return `${income.date || "??"} ???`;
+  if (income.status === "checking") return "??????";
+  if (income.status === "error") return "??????";
+  if (income.status === "waiting") return "??????";
+  return "??????";
+}
+
+function getIncomeStatusClass(income = {}) {
+  if (income.status === "ready" || income.ready) return "ok";
+  if (income.status === "error") return "danger";
+  if (income.status === "checking" || income.status === "waiting") return "warn";
+  return "muted";
 }
 
 function isResourceHidden(resource, nodeSettings = {}) {
@@ -209,21 +390,21 @@ function renderHiddenMenu(resources, nodeSettings = {}) {
   const hiddenUuids = new Set(nodeSettings.hiddenNodeUuids || []);
   const hiddenResources = sortResources(resources.filter((item) => hiddenUuids.has(item.uuid)), nodeSettings);
   if (!hiddenResources.length) {
-    els.hiddenMenu.innerHTML = `<span class="badge muted">已隐藏 0 条</span>`;
+    els.hiddenMenu.innerHTML = `<span class="badge muted">??? 0 ?</span>`;
     return;
   }
 
   els.hiddenMenu.innerHTML = `
     <details class="hidden-dropdown">
-      <summary class="hidden-summary">已隐藏 ${hiddenResources.length} 条</summary>
+      <summary class="hidden-summary">??? ${hiddenResources.length} ?</summary>
       <div class="hidden-dropdown-body">
         ${hiddenResources.map((item) => `
           <div class="hidden-node-row">
             <div>
-              <strong>${escapeHtml(item.remark || "未命名节点")}</strong>
-              <button type="button" class="uuid-button small" data-action="copy-uuid" data-uuid="${escapeHtml(item.uuid)}" title="复制真实 UUID">UUID</button>
+              <strong>${escapeHtml(item.remark || "?????")}</strong>
+              <button type="button" class="uuid-button small" data-action="copy-uuid" data-uuid="${escapeHtml(item.uuid)}" title="???? UUID">UUID</button>
             </div>
-            <button type="button" class="ghost-button" data-action="unhide-node" data-uuid="${escapeHtml(item.uuid)}">解除隐藏</button>
+            <button type="button" class="ghost-button" data-action="unhide-node" data-uuid="${escapeHtml(item.uuid)}">????</button>
           </div>
         `).join("")}
       </div>
@@ -234,40 +415,40 @@ function renderHiddenMenu(resources, nodeSettings = {}) {
 function renderNodeAlertPanel(resources, nodeSettings = {}) {
   const resource = resources.find((item) => item.uuid === selectedNodeUuid);
   if (!resource) {
-    els.selectedNodeLabel.textContent = "请选择一个节点";
-    els.nodeAlertList.innerHTML = `<div class="empty">还没有可配置的节点</div>`;
+    els.selectedNodeLabel.textContent = "???????";
+    els.nodeAlertList.innerHTML = `<div class="empty">?????????</div>`;
     return;
   }
 
   const storedAlerts = nodeSettings.nodeAlerts?.[resource.uuid] || [];
   if (!draftNodeAlerts.length && storedAlerts.length) draftNodeAlerts = cloneAlerts(storedAlerts);
 
-  els.selectedNodeLabel.textContent = `${resource.remark || "未命名节点"} · UUID 已隐藏`;
+  els.selectedNodeLabel.textContent = `${resource.remark || "?????"} ? UUID ???`;
   els.nodeAlertList.innerHTML = draftNodeAlerts.length ? draftNodeAlerts.map((rule, index) => `
     <article class="alert-rule-card" data-index="${index}">
       <div class="alert-rule-head">
         <div>
-          <strong>报警类型 1</strong>
-          <span>指定时间流量占比低于阈值</span>
+          <strong>???? 1</strong>
+          <span>????????????</span>
         </div>
-        <button type="button" class="ghost-button danger" data-action="remove-alert-rule" data-index="${index}">删除</button>
+        <button type="button" class="ghost-button danger" data-action="remove-alert-rule" data-index="${index}">??</button>
       </div>
       <div class="alert-rule-grid">
         <label class="switch-row">
-          <span>启用</span>
+          <span>??</span>
           <input type="checkbox" data-field="enabled" data-index="${index}" ${rule.enabled ? "checked" : ""}>
         </label>
         <label>
-          <span>时间点</span>
+          <span>???</span>
           <input type="time" data-field="time" data-index="${index}" value="${escapeHtml(rule.time || "00:00")}">
         </label>
         <label>
-          <span>低于百分比触发</span>
+          <span>???????</span>
           <input type="number" min="0" max="999" step="0.01" data-field="thresholdPercent" data-index="${index}" value="${escapeHtml(String(rule.thresholdPercent ?? 0))}">
         </label>
       </div>
     </article>
-  `).join("") : `<div class="empty">当前节点还没有报警规则，点“新增报警”即可添加。</div>`;
+  `).join("") : `<div class="empty">????????????????????????</div>`;
 }
 
 function renderTileAlertSettings(resource) {
@@ -276,17 +457,17 @@ function renderTileAlertSettings(resource) {
     <div class="tile-alert-settings">
       <div class="tile-alert-settings-head">
         <div>
-          <strong>${escapeHtml(resource.remark || "未命名节点")}</strong>
-          <span>报警设置</span>
+          <strong>${escapeHtml(resource.remark || "?????")}</strong>
+          <span>????</span>
         </div>
-        <button type="button" class="icon-button" data-action="close-tile-alerts" data-uuid="${escapeHtml(resource.uuid)}" title="返回监控" aria-label="返回监控">×</button>
+        <button type="button" class="icon-button" data-action="close-tile-alerts" data-uuid="${escapeHtml(resource.uuid)}" title="????" aria-label="????">?</button>
       </div>
       <div class="tile-alert-rules">
-        ${rules.length ? rules.map((rule, index) => renderTileAlertRule(rule, index, resource.uuid)).join("") : `<div class="empty compact-empty">当前节点还没有报警规则</div>`}
+        ${rules.length ? rules.map((rule, index) => renderTileAlertRule(rule, index, resource.uuid)).join("") : `<div class="empty compact-empty">???????????</div>`}
       </div>
       <div class="tile-alert-footer">
-        <button type="button" class="ghost-button" data-action="add-tile-alert-rule" data-uuid="${escapeHtml(resource.uuid)}">新增规则</button>
-        <button type="button" data-action="save-tile-alerts" data-uuid="${escapeHtml(resource.uuid)}">保存</button>
+        <button type="button" class="ghost-button" data-action="add-tile-alert-rule" data-uuid="${escapeHtml(resource.uuid)}">????</button>
+        <button type="button" data-action="save-tile-alerts" data-uuid="${escapeHtml(resource.uuid)}">??</button>
       </div>
     </div>
   `;
@@ -298,37 +479,37 @@ function renderTileMonitorSettings(resource) {
     <div class="tile-alert-settings">
       <div class="tile-alert-settings-head">
         <div>
-          <strong>${escapeHtml(resource.remark || "未命名节点")}</strong>
-          <span>监控预期</span>
+          <strong>${escapeHtml(resource.remark || "?????")}</strong>
+          <span>????</span>
         </div>
-        <button type="button" class="icon-button" data-action="close-tile-alerts" data-uuid="${escapeHtml(resource.uuid)}" title="返回监控" aria-label="返回监控">×</button>
+        <button type="button" class="icon-button" data-action="close-tile-alerts" data-uuid="${escapeHtml(resource.uuid)}" title="????" aria-label="????">?</button>
       </div>
       <div class="tile-monitor-form">
         <label class="switch-row">
-          <span>启用</span>
+          <span>??</span>
           <input type="checkbox" data-monitor-field="enabled" data-uuid="${escapeHtml(resource.uuid)}" ${monitor.enabled ? "checked" : ""}>
         </label>
         <label>
-          <span>开始时间</span>
+          <span>????</span>
           <input type="time" data-monitor-field="startTime" data-uuid="${escapeHtml(resource.uuid)}" value="${escapeHtml(monitor.startTime)}">
         </label>
         <label>
-          <span>结束时间</span>
+          <span>????</span>
           <input type="time" data-monitor-field="endTime" data-uuid="${escapeHtml(resource.uuid)}" value="${escapeHtml(monitor.endTime)}">
         </label>
         <label>
-          <span>预期流量 Mbps</span>
+          <span>???? Mbps</span>
           <input type="number" min="0" step="0.01" data-monitor-field="expectedFlowMbps" data-uuid="${escapeHtml(resource.uuid)}" value="${escapeHtml(String(monitor.expectedFlowMbps ?? 0))}">
         </label>
         <div class="monitor-color-guide">
-          <span><i class="guide-blue"></i>达标</span>
-          <span><i class="guide-yellow"></i>低于 10% 内</span>
-          <span><i class="guide-red"></i>低于 10% 以上</span>
+          <span><i class="guide-blue"></i>??</span>
+          <span><i class="guide-yellow"></i>?? 10% ?</span>
+          <span><i class="guide-red"></i>?? 10% ??</span>
         </div>
       </div>
       <div class="tile-alert-footer">
-        <button type="button" class="ghost-button danger" data-action="clear-tile-monitor" data-uuid="${escapeHtml(resource.uuid)}">清除</button>
-        <button type="button" data-action="save-tile-monitor" data-uuid="${escapeHtml(resource.uuid)}">保存</button>
+        <button type="button" class="ghost-button danger" data-action="clear-tile-monitor" data-uuid="${escapeHtml(resource.uuid)}">??</button>
+        <button type="button" data-action="save-tile-monitor" data-uuid="${escapeHtml(resource.uuid)}">??</button>
       </div>
     </div>
   `;
@@ -338,19 +519,19 @@ function renderTileAlertRule(rule, index, uuid) {
   return `
     <article class="tile-alert-rule" data-uuid="${escapeHtml(uuid)}" data-index="${index}">
       <div class="tile-alert-rule-head">
-        <strong>类型 1</strong>
-        <button type="button" class="ghost-button danger" data-action="remove-tile-alert-rule" data-uuid="${escapeHtml(uuid)}" data-index="${index}">删除</button>
+        <strong>?? 1</strong>
+        <button type="button" class="ghost-button danger" data-action="remove-tile-alert-rule" data-uuid="${escapeHtml(uuid)}" data-index="${index}">??</button>
       </div>
       <label class="switch-row">
-        <span>启用</span>
+        <span>??</span>
         <input type="checkbox" data-tile-alert-field="enabled" data-uuid="${escapeHtml(uuid)}" data-index="${index}" ${rule.enabled ? "checked" : ""}>
       </label>
       <label>
-        <span>时间点</span>
+        <span>???</span>
         <input type="time" data-tile-alert-field="time" data-uuid="${escapeHtml(uuid)}" data-index="${index}" value="${escapeHtml(rule.time || "00:00")}">
       </label>
       <label>
-        <span>流量占比低于</span>
+        <span>??????</span>
         <input type="number" min="0" max="999" step="0.01" data-tile-alert-field="thresholdPercent" data-uuid="${escapeHtml(uuid)}" data-index="${index}" value="${escapeHtml(String(rule.thresholdPercent ?? 0))}">
       </label>
     </article>
@@ -377,15 +558,15 @@ function getTileMonitorDraft(uuid, storedMonitor = null) {
 function renderAlertLogs(activeAlerts, history) {
   const logs = getVisibleAlertLogs(activeAlerts, history);
 
-  els.alertCount.textContent = `${logs.length} 条`;
+  els.alertCount.textContent = `${logs.length} ?`;
   els.clearAlertLogs.disabled = logs.length === 0;
   els.alertLogs.innerHTML = logs.length ? logs.map((alert) => `
     <div class="alert ${alert.severity === "critical" ? "critical" : ""}" data-alert-key="${escapeHtml(alert.logKey)}">
-      <button type="button" class="alert-close-button" data-action="dismiss-alert-log" data-alert-key="${escapeHtml(alert.logKey)}" title="清除这条报警" aria-label="清除这条报警">×</button>
+      <button type="button" class="alert-close-button" data-action="dismiss-alert-log" data-alert-key="${escapeHtml(alert.logKey)}" title="??????" aria-label="??????">?</button>
       <strong>${escapeHtml(alert.message || alert.id)}</strong>
-      <span>${escapeHtml(alert.nodeRemark || alert.metric || "-")} · ${escapeHtml(formatValue(alert.actual))} · ${escapeHtml(formatTime(alert.triggeredAt || alert.snapshotAt))}</span>
+      <span>${escapeHtml(alert.nodeRemark || alert.metric || "-")} ? ${escapeHtml(formatValue(alert.actual))} ? ${escapeHtml(formatTime(alert.triggeredAt || alert.snapshotAt))}</span>
     </div>
-  `).join("") : `<div class="empty">暂无报警日志</div>`;
+  `).join("") : `<div class="empty">??????</div>`;
 }
 
 function getVisibleAlertLogs(activeAlerts = [], history = []) {
@@ -420,8 +601,8 @@ function renderServerChanSettings(settings) {
   els.serverChanEnabled.checked = Boolean(settings.enabled);
   els.serverChanSendKey.value = "";
   els.serverChanSendKey.placeholder = settings.hasSendKey
-    ? `已保存 ${settings.sendKeyPreview}，留空则保持原 SendKey`
-    : "请输入 Server酱 SendKey";
+    ? `??? ${settings.sendKeyPreview}??????? SendKey`
+    : "??? Server? SendKey";
   els.subjectPrefix.value = settings.subjectPrefix || "[Resource Monitor Alert]";
   els.cooldownSeconds.value = settings.cooldownSeconds ?? 600;
 }
@@ -477,7 +658,7 @@ function renderSamplingInterval(config = {}) {
   if (![...els.intervalSeconds.options].some((option) => option.value === seconds)) {
     const option = document.createElement("option");
     option.value = seconds;
-    option.textContent = `${seconds} 秒`;
+    option.textContent = `${seconds} ?`;
     els.intervalSeconds.appendChild(option);
   }
   els.intervalSeconds.value = seconds;
@@ -492,9 +673,9 @@ function getActiveNodeMute(uuid, nodeSettings = {}) {
 }
 
 function formatMuteTitle(mute) {
-  if (!mute) return "禁用报警";
-  if (mute.mode === "permanent") return "报警已永久禁用";
-  return `报警禁用至 ${formatTime(mute.until)}`;
+  if (!mute) return "????";
+  if (mute.mode === "permanent") return "???????";
+  return `????? ${formatTime(mute.until)}`;
 }
 
 function closeMuteMenus() {
@@ -565,7 +746,7 @@ function renderNodeChart(points, item) {
     <polyline class="mini-line mini-flow ${chartTone}" points="${flowLine}"></polyline>
     <circle class="mini-dot" cx="${xFor(values.length - 1)}" cy="${yFor(latest.flow)}" r="4"></circle>
     <text class="mini-label" x="${pad.left}" y="14">100% = ${escapeSvg(formatNumber(bandwidth))} Mbps</text>
-    <text class="mini-label end" x="${width - pad.right}" y="14">${escapeSvg(formatNumber(currentFlow))} Mbps · ${escapeSvg(formatPercent(item.bandwidthUsagePercent))}</text>
+    <text class="mini-label end" x="${width - pad.right}" y="14">${escapeSvg(formatNumber(currentFlow))} Mbps ? ${escapeSvg(formatPercent(item.bandwidthUsagePercent))}</text>
     ${ticks.map((tick) => `
       <line class="mini-tick" x1="${xFor(tick.index)}" y1="${baselineY}" x2="${xFor(tick.index)}" y2="${baselineY + 4}"></line>
       <text class="mini-time-label" x="${xFor(tick.index)}" y="${height - 8}">${escapeSvg(formatChartTime(tick.checkedAt))}</text>
@@ -678,7 +859,7 @@ function onNodeChartHover(event) {
 
   tooltip.innerHTML = `
     <strong>${escapeHtml(formatNumber(nearest.flow))} Mbps</strong>
-    <span>${escapeHtml(formatPercent(nearest.percent))} · ${escapeHtml(formatChartTime(nearest.checkedAt))}</span>
+    <span>${escapeHtml(formatPercent(nearest.percent))} ? ${escapeHtml(formatChartTime(nearest.checkedAt))}</span>
   `;
   tooltip.style.left = `${left}px`;
   tooltip.style.top = `${top}px`;
@@ -860,7 +1041,7 @@ function onResourceDragEnd() {
 }
 
 async function saveNodeOrder(uuids) {
-  els.saveMessage.textContent = "正在保存节点排序...";
+  els.saveMessage.textContent = "????????...";
   try {
     const hidden = latestPayload?.nodeSettings?.hiddenNodeUuids || [];
     const fullOrder = [...uuids, ...hidden.filter((uuid) => !uuids.includes(uuid))];
@@ -870,10 +1051,10 @@ async function saveNodeOrder(uuids) {
       body: JSON.stringify({ uuids: fullOrder })
     });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || "排序保存失败");
+    if (!res.ok) throw new Error(body.error || "??????");
     latestPayload.nodeSettings = body.nodeSettings;
     render(latestPayload);
-    els.saveMessage.textContent = "节点排序已保存";
+    els.saveMessage.textContent = "???????";
   } catch (error) {
     els.saveMessage.textContent = error.message;
   }
@@ -882,10 +1063,10 @@ async function saveNodeOrder(uuids) {
 async function copyUuid(uuid, button) {
   try {
     await navigator.clipboard.writeText(uuid);
-    flashButton(button, "已复制");
+    flashButton(button, "???");
   } catch {
     fallbackCopy(uuid);
-    flashButton(button, "已复制");
+    flashButton(button, "???");
   }
 }
 
@@ -929,7 +1110,7 @@ function removeTileAlertRule(uuid, index) {
 
 async function saveTileAlerts(uuid, button) {
   button.disabled = true;
-  els.saveMessage.textContent = "正在保存节点报警设置...";
+  els.saveMessage.textContent = "??????????...";
   try {
     const alerts = getTileAlertDraft(uuid);
     const res = await fetch("/api/node-alerts", {
@@ -938,12 +1119,12 @@ async function saveTileAlerts(uuid, button) {
       body: JSON.stringify({ uuid, alerts })
     });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || "保存失败");
+    if (!res.ok) throw new Error(body.error || "????");
     latestPayload.nodeSettings = body.nodeSettings;
     tileAlertDrafts.set(uuid, cloneAlerts(body.nodeSettings?.nodeAlerts?.[uuid] || []));
     flippedTileUuid = "";
     render(latestPayload);
-    els.saveMessage.textContent = "节点报警设置已保存";
+    els.saveMessage.textContent = "?????????";
   } catch (error) {
     els.saveMessage.textContent = error.message;
   } finally {
@@ -953,7 +1134,7 @@ async function saveTileAlerts(uuid, button) {
 
 async function saveTileMonitor(uuid, button) {
   button.disabled = true;
-  els.saveMessage.textContent = "正在保存监控预期...";
+  els.saveMessage.textContent = "????????...";
   try {
     const monitor = getTileMonitorDraft(uuid);
     const res = await fetch("/api/node-monitor-setting", {
@@ -962,12 +1143,12 @@ async function saveTileMonitor(uuid, button) {
       body: JSON.stringify({ uuid, monitor })
     });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || "保存失败");
+    if (!res.ok) throw new Error(body.error || "????");
     latestPayload.nodeSettings = body.nodeSettings;
     tileMonitorDrafts.set(uuid, { ...(body.nodeSettings?.nodeMonitors?.[uuid] || monitor) });
     flippedTileUuid = "";
     render(latestPayload);
-    els.saveMessage.textContent = "监控预期已保存";
+    els.saveMessage.textContent = "???????";
   } catch (error) {
     els.saveMessage.textContent = error.message;
   } finally {
@@ -977,7 +1158,7 @@ async function saveTileMonitor(uuid, button) {
 
 async function clearTileMonitor(uuid, button) {
   button.disabled = true;
-  els.saveMessage.textContent = "正在清除监控预期...";
+  els.saveMessage.textContent = "????????...";
   try {
     const res = await fetch("/api/node-monitor-setting", {
       method: "POST",
@@ -985,12 +1166,12 @@ async function clearTileMonitor(uuid, button) {
       body: JSON.stringify({ uuid, monitor: null })
     });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || "清除失败");
+    if (!res.ok) throw new Error(body.error || "????");
     latestPayload.nodeSettings = body.nodeSettings;
     tileMonitorDrafts.delete(uuid);
     flippedTileUuid = "";
     render(latestPayload);
-    els.saveMessage.textContent = "监控预期已清除";
+    els.saveMessage.textContent = "???????";
   } catch (error) {
     els.saveMessage.textContent = error.message;
   } finally {
@@ -1000,7 +1181,7 @@ async function clearTileMonitor(uuid, button) {
 
 function addNodeAlertRule() {
   if (!selectedNodeUuid) {
-    els.nodeAlertMessage.textContent = "请先选择一个节点";
+    els.nodeAlertMessage.textContent = "????????";
     return;
   }
   draftNodeAlerts.push({
@@ -1032,11 +1213,11 @@ function onNodeAlertListInput(event) {
 
 async function saveNodeAlerts() {
   if (!selectedNodeUuid) {
-    els.nodeAlertMessage.textContent = "请先选择一个节点";
+    els.nodeAlertMessage.textContent = "????????";
     return;
   }
   els.saveNodeAlerts.disabled = true;
-  els.nodeAlertMessage.textContent = "正在保存报警...";
+  els.nodeAlertMessage.textContent = "??????...";
   try {
     const res = await fetch("/api/node-alerts", {
       method: "POST",
@@ -1044,11 +1225,11 @@ async function saveNodeAlerts() {
       body: JSON.stringify({ uuid: selectedNodeUuid, alerts: draftNodeAlerts })
     });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || "保存失败");
+    if (!res.ok) throw new Error(body.error || "????");
     latestPayload.nodeSettings = body.nodeSettings;
     draftNodeAlerts = cloneAlerts(body.nodeSettings?.nodeAlerts?.[selectedNodeUuid] || []);
     render(latestPayload);
-    els.nodeAlertMessage.textContent = "报警设置已保存";
+    els.nodeAlertMessage.textContent = "???????";
   } catch (error) {
     els.nodeAlertMessage.textContent = error.message;
   } finally {
@@ -1058,7 +1239,7 @@ async function saveNodeAlerts() {
 
 async function saveServerChanSettings() {
   els.saveServerChanSettings.disabled = true;
-  els.serverChanMessage.textContent = "正在保存 Server酱设置...";
+  els.serverChanMessage.textContent = "???? Server???...";
   try {
     const payload = {
       enabled: els.serverChanEnabled.checked,
@@ -1073,12 +1254,12 @@ async function saveServerChanSettings() {
       body: JSON.stringify(payload)
     });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || "保存失败");
+    if (!res.ok) throw new Error(body.error || "????");
     latestPayload.config = body.config;
     latestPayload.serverChanSettings = body.serverChanSettings;
     serverChanFormDirty = false;
     render(latestPayload);
-    els.serverChanMessage.textContent = "Server酱设置已保存";
+    els.serverChanMessage.textContent = "Server??????";
   } catch (error) {
     els.serverChanMessage.textContent = error.message;
   } finally {
@@ -1088,7 +1269,7 @@ async function saveServerChanSettings() {
 
 async function updateNodeVisibility(uuid, hidden, button) {
   button.disabled = true;
-  els.saveMessage.textContent = hidden ? "正在隐藏节点..." : "正在恢复节点...";
+  els.saveMessage.textContent = hidden ? "??????..." : "??????...";
   try {
     const res = await fetch("/api/node-visibility", {
       method: "POST",
@@ -1096,11 +1277,11 @@ async function updateNodeVisibility(uuid, hidden, button) {
       body: JSON.stringify({ uuid, hidden })
     });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || "操作失败");
+    if (!res.ok) throw new Error(body.error || "????");
     latestPayload.nodeSettings = body.nodeSettings;
     syncLocalNodeVisibility(uuid, hidden);
     render(latestPayload);
-    els.saveMessage.textContent = hidden ? "节点已隐藏" : "节点已恢复";
+    els.saveMessage.textContent = hidden ? "?????" : "?????";
   } catch (error) {
     els.saveMessage.textContent = error.message;
   } finally {
@@ -1117,7 +1298,7 @@ function syncLocalNodeVisibility(uuid, hidden) {
 
 async function updateNodeAlertMute(uuid, duration, button) {
   button.disabled = true;
-  els.saveMessage.textContent = "正在保存报警禁用设置...";
+  els.saveMessage.textContent = "??????????...";
   try {
     const res = await fetch("/api/node-alert-mute", {
       method: "POST",
@@ -1125,10 +1306,10 @@ async function updateNodeAlertMute(uuid, duration, button) {
       body: JSON.stringify({ uuid, duration })
     });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || "报警禁用设置保存失败");
+    if (!res.ok) throw new Error(body.error || "??????????");
     latestPayload.nodeSettings = body.nodeSettings;
     render(latestPayload);
-    els.saveMessage.textContent = duration === "none" ? "报警已恢复" : "报警已禁用";
+    els.saveMessage.textContent = duration === "none" ? "?????" : "?????";
   } catch (error) {
     els.saveMessage.textContent = error.message;
   } finally {
@@ -1143,7 +1324,7 @@ function dismissNodeAlert(uuid) {
   }
   writeDismissedNodeAlertIds();
   render(latestPayload);
-  els.saveMessage.textContent = "当前节点报警提示已消除";
+  els.saveMessage.textContent = "???????????";
 }
 
 function dismissAlertLog(logKey) {
@@ -1157,7 +1338,7 @@ function dismissAlertLog(logKey) {
   }
   writeDismissedAlertLogKeys();
   render(latestPayload);
-  els.saveMessage.textContent = "报警日志已清除";
+  els.saveMessage.textContent = "???????";
 }
 
 function clearAlertLogs() {
@@ -1171,14 +1352,14 @@ function clearAlertLogs() {
   writeDismissedAlertLogKeys();
   writeDismissedNodeAlertIds();
   render(latestPayload);
-  els.saveMessage.textContent = "报警日志已全部清除";
+  els.saveMessage.textContent = "?????????";
 }
 
 async function saveSamplingInterval() {
   if (!latestPayload?.config) return;
   const intervalSeconds = Math.max(10, Number(els.intervalSeconds.value || 60));
   els.intervalSeconds.disabled = true;
-  els.saveMessage.textContent = "正在保存采集频率...";
+  els.saveMessage.textContent = "????????...";
   try {
     const nextConfig = {
       ...latestPayload.config,
@@ -1193,10 +1374,10 @@ async function saveSamplingInterval() {
       body: JSON.stringify(nextConfig)
     });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || "采集频率保存失败");
+    if (!res.ok) throw new Error(body.error || "????????");
     latestPayload.config = body;
     renderSamplingInterval(body);
-    els.saveMessage.textContent = `采集频率已设置为 ${formatInterval(intervalSeconds)}`;
+    els.saveMessage.textContent = `???????? ${formatInterval(intervalSeconds)}`;
   } catch (error) {
     els.saveMessage.textContent = error.message;
     renderSamplingInterval(latestPayload.config);
@@ -1207,11 +1388,11 @@ async function saveSamplingInterval() {
 
 async function runAction(url, button, successText, messageEl = els.saveMessage) {
   button.disabled = true;
-  messageEl.textContent = "正在执行...";
+  messageEl.textContent = "????...";
   try {
     const res = await fetch(url, { method: "POST" });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || "请求失败");
+    if (!res.ok) throw new Error(body.error || "????");
     messageEl.textContent = successText;
   } catch (error) {
     messageEl.textContent = error.message;
@@ -1225,12 +1406,12 @@ async function loginAccount(event) {
   const username = els.loginUsername.value.trim();
   const password = els.loginPassword.value;
   if (!username || !password) {
-    els.loginMessage.textContent = "请输入账号和密码";
+    els.loginMessage.textContent = "????????";
     return;
   }
 
   els.loginButton.disabled = true;
-  els.loginMessage.textContent = "正在登录并刷新资源数据...";
+  els.loginMessage.textContent = "???????????...";
   try {
     const res = await fetch("/api/login", {
       method: "POST",
@@ -1238,9 +1419,9 @@ async function loginAccount(event) {
       body: JSON.stringify({ username, password })
     });
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || "登录失败");
+    if (!res.ok) throw new Error(body.error || "????");
     els.loginPassword.value = "";
-    els.loginMessage.textContent = `${body.message}，HTTP ${body.metrics?.httpStatus ?? "-"}`;
+    els.loginMessage.textContent = `${body.message}?HTTP ${body.metrics?.httpStatus ?? "-"}`;
   } catch (error) {
     els.loginMessage.textContent = error.message;
   } finally {
@@ -1275,6 +1456,38 @@ function formatNumber(value) {
   return number.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
 }
 
+function formatCurrency(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return "-";
+  return number.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function formatFlowGb(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return "-";
+  return `${number.toLocaleString("zh-CN", { maximumFractionDigits: 3 })} G`;
+}
+
+function formatSettlementUsage(incomeItem = {}, resource = null) {
+  const settlementMbps = Number(incomeItem.flowGb || 0) * 1000;
+  const bandwidthMbps = Number(resource?.bandwidthMbps || 0);
+  if (!Number.isFinite(settlementMbps) || !Number.isFinite(bandwidthMbps) || bandwidthMbps <= 0) return "-";
+  return formatPercent(percent(settlementMbps, bandwidthMbps));
+}
+
+function calculateMonthlyUnitPrice(item = {}) {
+  const income = Number(item.incomeYuan || 0);
+  const flow = Number(item.flowGb || 0);
+  if (!Number.isFinite(income) || !Number.isFinite(flow) || flow <= 0) return 0;
+  return round((income / flow) * daysInMonth(item.date), 2);
+}
+
+function daysInMonth(dateKey) {
+  const [year, month] = String(dateKey || "").split("-").map(Number);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) return 30;
+  return new Date(year, month, 0).getDate();
+}
+
 function round(value, digits = 2) {
   const factor = 10 ** digits;
   return Math.round(Number(value || 0) * factor) / factor;
@@ -1293,10 +1506,16 @@ function formatPercent(value) {
   return `${number.toLocaleString("zh-CN", { maximumFractionDigits: 2 })}%`;
 }
 
+function formatTaxRate(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "6%";
+  return formatPercent(number > 1 ? number : number * 100);
+}
+
 function formatInterval(seconds) {
   const value = Number(seconds || 0);
-  if (value >= 60 && value % 60 === 0) return `${value / 60} 分钟`;
-  return `${value} 秒`;
+  if (value >= 60 && value % 60 === 0) return `${value / 60} ??`;
+  return `${value} ?`;
 }
 
 function formatChartTime(value) {

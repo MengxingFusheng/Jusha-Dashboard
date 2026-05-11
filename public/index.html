@@ -10,36 +10,36 @@
     <header class="topbar">
       <div class="topbar-login">
         <form id="loginForm" class="login-form compact-login">
-          <input id="loginUsername" name="username" type="text" autocomplete="username" placeholder="账号">
-          <input id="loginPassword" name="password" type="password" autocomplete="current-password" placeholder="密码">
-          <button id="loginButton" type="submit">登录</button>
+          <input id="loginUsername" name="username" type="text" autocomplete="username" placeholder="??">
+          <input id="loginPassword" name="password" type="password" autocomplete="current-password" placeholder="??">
+          <button id="loginButton" type="submit">??</button>
         </form>
         <div class="topbar-login-status">
-          <span id="cookieBadge" class="badge muted">未保存 Cookie</span>
+          <span id="cookieBadge" class="badge muted">??? Cookie</span>
           <span id="loginMessage"></span>
         </div>
       </div>
 
       <div class="topbar-title">
         <h1>Dash Board</h1>
-        <p id="targetLabel" class="sr-only">正在读取监控状态...</p>
+        <p id="targetLabel" class="sr-only">????????...</p>
       </div>
 
       <div class="actions">
-        <span id="runStatus" class="badge muted">等待首检</span>
-        <span id="lastRun" class="badge muted">最近检查 -</span>
+        <span id="runStatus" class="badge muted">????</span>
+        <span id="lastRun" class="badge muted">???? -</span>
         <label class="frequency-control">
-          <span>采集频率</span>
+          <span>????</span>
           <select id="intervalSeconds">
-            <option value="10">10 秒</option>
-            <option value="30">30 秒</option>
-            <option value="60">1 分钟</option>
-            <option value="120">2 分钟</option>
-            <option value="300">5 分钟</option>
-            <option value="600">10 分钟</option>
+            <option value="10">10 ?</option>
+            <option value="30">30 ?</option>
+            <option value="60">1 ??</option>
+            <option value="120">2 ??</option>
+            <option value="300">5 ??</option>
+            <option value="600">10 ??</option>
           </select>
         </label>
-        <button id="checkNow" type="button">立即检查</button>
+        <button id="checkNow" type="button">????</button>
       </div>
     </header>
 
@@ -47,24 +47,48 @@
       <section class="panel resource-panel">
         <div class="panel-head">
           <div class="panel-title-block">
-            <h2>节点流量监控</h2>
-            <span id="resourceCount" class="badge muted">0 条</span>
+            <h2>??????</h2>
+            <span id="resourceCount" class="badge muted">0 ?</span>
+            <label class="tile-scale-control" title="????????">
+              <span>??</span>
+              <input id="resourceTileScale" type="range" min="0.85" max="1.3" step="0.05" value="1" aria-label="??????">
+              <output id="resourceTileScaleValue">100%</output>
+            </label>
           </div>
           <div id="hiddenMenu" class="hidden-menu"></div>
         </div>
         <div id="resources" class="resource-tiles"></div>
       </section>
 
+      <section class="panel income-panel">
+        <div class="panel-head">
+          <div class="panel-title-block">
+            <h2>??</h2>
+            <span id="incomeBadge" class="badge muted">??????</span>
+            <label class="tile-scale-control" title="????????">
+              <span>??</span>
+              <input id="incomeTileScale" type="range" min="0.85" max="1.3" step="0.05" value="1" aria-label="??????">
+              <output id="incomeTileScaleValue">100%</output>
+            </label>
+          </div>
+          <div class="actions compact">
+            <button id="incomeCheckNow" type="button">??????</button>
+          </div>
+        </div>
+        <div id="incomeSummary" class="income-summary"></div>
+        <div id="incomeTiles" class="income-tiles"></div>
+      </section>
+
       <section class="workspace">
         <section id="nodeAlertPanel" class="panel node-alert-panel">
           <div class="panel-head">
             <div>
-              <h2>报警设置</h2>
-              <p id="selectedNodeLabel" class="subtle">请选择一个节点</p>
+              <h2>????</h2>
+              <p id="selectedNodeLabel" class="subtle">???????</p>
             </div>
             <div class="actions compact">
-              <button id="addNodeAlert" type="button">新增报警</button>
-              <button id="saveNodeAlerts" type="button">保存报警</button>
+              <button id="addNodeAlert" type="button">????</button>
+              <button id="saveNodeAlerts" type="button">????</button>
             </div>
           </div>
           <div id="nodeAlertList" class="node-alert-list"></div>
@@ -73,10 +97,10 @@
 
         <section class="panel">
           <div class="panel-head">
-            <h2>报警日志</h2>
+            <h2>????</h2>
             <div class="actions compact">
-              <span id="alertCount" class="badge muted">0 条</span>
-              <button id="clearAlertLogs" type="button" class="ghost-button danger">清除全部</button>
+              <span id="alertCount" class="badge muted">0 ?</span>
+              <button id="clearAlertLogs" type="button" class="ghost-button danger">????</button>
             </div>
           </div>
           <div id="alertLogs" class="alert-list"></div>
@@ -86,28 +110,28 @@
       <section class="workspace single-row">
         <section class="panel serverchan-panel">
           <div class="panel-head">
-            <h2>Server酱推送</h2>
+            <h2>Server???</h2>
             <div class="actions compact">
-              <span id="serverChanBadge" class="badge muted">推送未启用</span>
-              <button id="testServerChan" type="button">测试推送</button>
-              <button id="saveServerChanSettings" type="button">保存推送</button>
+              <span id="serverChanBadge" class="badge muted">?????</span>
+              <button id="testServerChan" type="button">????</button>
+              <button id="saveServerChanSettings" type="button">????</button>
             </div>
           </div>
           <form id="serverChanForm" class="email-form">
             <label class="switch-row">
-              <span>启用 Server酱报警</span>
+              <span>?? Server???</span>
               <input id="serverChanEnabled" type="checkbox">
             </label>
             <label>
               <span>SendKey</span>
-              <input id="serverChanSendKey" type="password" autocomplete="new-password" placeholder="留空则保持已保存 SendKey">
+              <input id="serverChanSendKey" type="password" autocomplete="new-password" placeholder="???????? SendKey">
             </label>
             <label>
-              <span>推送标题前缀</span>
+              <span>??????</span>
               <input id="subjectPrefix" type="text" placeholder="[Resource Monitor Alert]">
             </label>
             <label>
-              <span>冷却时间（秒）</span>
+              <span>???????</span>
               <input id="cooldownSeconds" type="number" min="0" step="1">
             </label>
           </form>

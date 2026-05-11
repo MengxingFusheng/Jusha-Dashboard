@@ -26,6 +26,19 @@
     "lookbackMinutes": 60,
     "maxPoints": 30
   },
+  "income": {
+    "enabled": true,
+    "startTime": "06:30",
+    "retryIntervalMinutes": 15,
+    "billType": 0,
+    "taxRate": 0.06
+  },
+  "incomeForecast": {
+    "enabled": true,
+    "historyDays": 5,
+    "refreshMinutes": 30,
+    "maxMonitorPoints": 500
+  },
   "extractors": [
     {
       "key": "apiSuccess",
@@ -93,6 +106,6 @@
   "serverChan": {
     "enabled": true,
     "cooldownSeconds": 600,
-    "subjectPrefix": "[聚沙报警]"
+    "subjectPrefix": "[????]"
   }
 }
