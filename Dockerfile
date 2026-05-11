@@ -9,6 +9,7 @@ COPY package.json ./
 COPY server.js ./
 COPY config ./config
 COPY public ./public
+COPY scripts ./scripts
 COPY data/.gitkeep ./data/.gitkeep
 
 RUN mkdir -p /app/data /app/logs

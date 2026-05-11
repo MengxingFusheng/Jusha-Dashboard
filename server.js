@@ -19,7 +19,8 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 await loadEnv(ENV_PATH);
 
 const PORT = Number(process.env.PORT || 3000);
-const FORECAST_VERSION = 3;
+const FORECAST_VERSION = 4;
+const HISTORY_BACKFILL_TAG = "monitor-history-backfill";
 
 let config = normalizeConfig(await readJson(CONFIG_PATH));
 let history = await readJson(HISTORY_PATH, []);
@@ -30,13 +31,17 @@ let state = await readJson(STATE_PATH, {
   latest: null,
   activeAlerts: [],
   lastEmailByRule: {},
-  lastNodeAlertByRule: {}
+  lastNodeAlertByRule: {},
+  historyBackfill: null
 });
 let nodeSettings = normalizeNodeSettings(await readJson(NODE_SETTINGS_PATH, {}));
 let incomeState = normalizeIncomeState(await readJson(INCOME_PATH, {}));
 let forecastState = normalizeForecastState(await readJson(FORECAST_PATH, {}));
 let timer = null;
 let incomeTimer = null;
+let backfillRunning = false;
+let postLoginRefreshRunning = false;
+let startupBackfillPending = Boolean(process.env.MONITOR_COOKIE);
 const clients = new Set();
 
 startScheduler();
@@ -120,7 +125,7 @@ async function runIncomeEndpoint(res) {
 
 async function testServerChanEndpoint(res) {
   await sendServerChanAlert({
-    rule: { id: "test-serverchan", severity: "info", message: "???? Server?????" },
+    rule: { id: "test-serverchan", severity: "info", message: "这是一条 Server酱测试消息" },
     metricValue: "OK",
     snapshot: state.latest || { metrics: {}, target: config.target, checkedAt: new Date().toISOString() }
   }, true);
@@ -130,37 +135,55 @@ async function testServerChanEndpoint(res) {
 async function loginEndpoint(req, res) {
   const { username, password } = await readBodyJson(req);
   if (!username || !password) {
-    return sendJson(res, { error: "????????" }, 400);
+    return sendJson(res, { error: "账号和密码不能为空" }, 400);
   }
 
   const login = await loginTargetSite({ username, password });
   if (!login.success) {
-    return sendJson(res, { error: login.message || "????", status: login.status }, 401);
+    return sendJson(res, { error: login.message || "登录失败", status: login.status }, 401);
   }
 
   process.env.MONITOR_COOKIE = login.cookie;
   await upsertEnvValue(ENV_PATH, "MONITOR_COOKIE", login.cookie);
   await upsertEnvValue(ENV_PATH, "MONITOR_USER_AGENT", defaultUserAgent());
-  const snapshot = await runCheck();
-  const income = await runIncomeCheck({ force: true });
-  startScheduler();
-  startIncomeScheduler();
+  await publish();
+  queuePostLoginRefresh();
   return sendJson(res, {
     ok: true,
-    message: "?????Cookie ???",
+    message: "登录成功，正在后台抓取数据",
     username,
-    checkedAt: snapshot.checkedAt,
-    metrics: snapshot.metrics,
-    alerts: snapshot.alerts || [],
-    income
+    checkedAt: new Date().toISOString(),
+    metrics: state.latest?.metrics || {},
+    alerts: state.activeAlerts || [],
+    income: incomeState,
+    background: true
   });
+}
+
+function queuePostLoginRefresh() {
+  if (postLoginRefreshRunning) return;
+  postLoginRefreshRunning = true;
+  void (async () => {
+    try {
+      await runCheck({ forceBackfill: true });
+      startScheduler();
+      await runIncomeCheck({ force: true });
+      startIncomeScheduler();
+    } catch (error) {
+      console.error(`登录后后台抓取失败: ${error.message}`);
+    } finally {
+      postLoginRefreshRunning = false;
+    }
+  })();
 }
 
 async function updateConfig(req, res) {
   const next = await readBodyJson(req);
   validateConfig(next);
   config = normalizeConfig(next);
+  incomeState = normalizeIncomeState(incomeState);
   await writeJson(CONFIG_PATH, config);
+  await persistIncomeState();
   await publish();
   startScheduler();
   startIncomeScheduler();
@@ -251,12 +274,13 @@ async function updateNodeOrder(req, res) {
 
 async function updateServerChanSettings(req, res) {
   const body = await readBodyJson(req);
-  config.serverChan = {
-    ...(config.serverChan || {}),
+  config.serverChan = normalizeServerChanConfig({
+    ...config.serverChan,
     enabled: Boolean(body.enabled),
     cooldownSeconds: Math.max(0, Number(body.cooldownSeconds || 0)),
-    subjectPrefix: String(body.subjectPrefix || "[Resource Monitor Alert]")
-  };
+    subjectPrefix: String(body.subjectPrefix || "[Resource Monitor Alert]"),
+    pushItems: normalizeServerChanPushItems(body.pushItems ?? config.serverChan?.pushItems)
+  });
   await writeJson(CONFIG_PATH, config);
 
   const envUpdates = {
@@ -333,7 +357,7 @@ async function runIncomeCheck({ force = false, targetDate = getYesterdayDateKey(
       status: "error",
       lastCheckedAt: checkedAt,
       nextCheckAt: new Date(Date.now() + retryMinutes * 60 * 1000).toISOString(),
-      error: error.message || "??????",
+      error: error.message || "收益检查失败",
       items: previousItems,
       summary: summarizeIncomeItems(previousItems),
       month: previousMonth,
@@ -348,6 +372,7 @@ async function runIncomeCheck({ force = false, targetDate = getYesterdayDateKey(
 
 async function maybeSendIncomeNotification(income) {
   if (!income.ready || !income.date || income.notification?.date === income.date) return income;
+  if (!isServerChanPushEnabled("incomeSummary")) return income;
 
   const notification = {
     ...(income.notification || {}),
@@ -360,9 +385,9 @@ async function maybeSendIncomeNotification(income) {
     notification.date = income.date;
     notification.sentAt = new Date().toISOString();
   } catch (error) {
-    notification.error = error.message || "????????";
+    notification.error = error.message || "收益推送失败";
     notification.failedAt = new Date().toISOString();
-    console.error(`????????: ${notification.error}`);
+    console.error(`收益推送失败: ${notification.error}`);
   }
 
   return normalizeIncomeState({
@@ -372,11 +397,10 @@ async function maybeSendIncomeNotification(income) {
 }
 
 async function sendIncomeServerChanNotification(income) {
-  if (!config.serverChan?.enabled) throw new Error("Server??????");
-  if (!process.env.SERVERCHAN_SENDKEY) throw new Error("Server? SendKey ???");
+  if (!process.env.SERVERCHAN_SENDKEY) throw new Error("Server酱 SendKey 未配置");
 
   await postServerChanMessage(
-    `${config.serverChan?.subjectPrefix || "[????]"} ${income.date} ????`,
+    `${config.serverChan?.subjectPrefix || "[聚沙]"} ${income.date} 收益`,
     buildIncomeServerChanMessage(income)
   );
 }
@@ -386,57 +410,55 @@ function buildIncomeServerChanMessage(income) {
   const month = income.month || null;
   const items = income.items || [];
   const detail = items.length
-    ? items.map((item) => `- ${item.remark || item.host || item.uuid}: ?? ?${formatCurrencyText(item.incomeYuan)}????? ${formatGbText(item.flowGb)}`).join("\n")
-    : "- ????????";
+    ? items.map((item) => `- ${item.remark || item.host || item.uuid}: 收益 ¥${formatCurrencyText(item.incomeYuan)}，结算流量 ${formatGbText(item.flowGb)}`).join("\n")
+    : "- 暂无收益明细";
   const monthlyLines = month ? [
-    `- ??????: ?${formatCurrencyText(month.totalIncomeYuan)}`,
-    `- ??????(${formatPercentText(month.taxRate * 100)}?): ?${formatCurrencyText(month.netIncomeYuan)}`
+    `- 本月税前收益: ¥${formatCurrencyText(month.totalIncomeYuan)}`,
+    `- 本月税后收益(${formatPercentText(month.taxRate * 100)}%): ¥${formatCurrencyText(month.netIncomeYuan)}`,
+    `- 每月固定支出: ¥${formatCurrencyText(month.monthlyFixedExpenseYuan)}`,
+    `- 本月净利润: ¥${formatCurrencyText(month.netProfitYuan)}`
   ] : [];
 
   return [
-    `### ?????? ${income.date}`,
+    `### 聚沙收益 ${income.date}`,
     "",
-    `- ???: ?${formatCurrencyText(summary.totalIncomeYuan)}`,
-    `- ?????: ${formatGbText(summary.totalFlowGb)}`,
+    `- 昨日收益: ¥${formatCurrencyText(summary.totalIncomeYuan)}`,
+    `- 昨日流量: ${formatGbText(summary.totalFlowGb)}`,
     ...monthlyLines,
-    `- ????: ${summary.count || items.length} ?`,
+    `- 节点数量: ${summary.count || items.length} 个`,
     "",
-    "#### ????",
+    "#### 收益明细",
     detail
   ].join("\n");
 }
 
 async function fetchIncomeDetail(date) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Number(config.target?.timeoutMs || 15000));
   const url = new URL(`https://cloud.tingyutech.com/api/jusha/bill/base/resource/settlement/incomeDetail/exact/${encodeURIComponent(date)}`);
   url.searchParams.set("billType", String(Number(config.income?.billType ?? 0)));
 
-  try {
-    const response = await fetch(url, {
-      headers: {
-        "Accept": "application/json,text/plain,*/*",
-        "Referer": "https://cloud.tingyutech.com/jusha/customer/bill/upstream",
-        ...(process.env.MONITOR_COOKIE ? { Cookie: process.env.MONITOR_COOKIE } : {}),
-        ...(process.env.MONITOR_USER_AGENT ? { "User-Agent": process.env.MONITOR_USER_AGENT } : {})
-      },
-      signal: controller.signal,
-      redirect: "follow"
-    });
-    const text = await response.text();
-    let payload = {};
-    try { payload = JSON.parse(text); } catch {}
-    if (!response.ok || payload.success === false) {
-      throw new Error(payload.message || text || `???? HTTP ${response.status}`);
-    }
-
-    if (Array.isArray(payload?.data?.list)) return payload.data.list;
-    if (Array.isArray(payload?.data)) return payload.data;
-    if (Array.isArray(payload?.list)) return payload.list;
-    return [];
-  } finally {
-    clearTimeout(timeout);
+  const response = await fetchWithRetry(url, {
+    headers: {
+      "Accept": "application/json,text/plain,*/*",
+      "Referer": "https://cloud.tingyutech.com/jusha/customer/bill/upstream",
+      ...(process.env.MONITOR_COOKIE ? { Cookie: process.env.MONITOR_COOKIE } : {}),
+      ...(process.env.MONITOR_USER_AGENT ? { "User-Agent": process.env.MONITOR_USER_AGENT } : {})
+    },
+    redirect: "follow"
+  }, {
+    timeoutMs: Number(config.target?.timeoutMs || 15000),
+    label: "收益接口"
+  });
+  const text = await response.text();
+  let payload = {};
+  try { payload = JSON.parse(text); } catch {}
+  if (!response.ok || payload.success === false) {
+    throw new Error(payload.message || text || `收益接口 HTTP ${response.status}`);
   }
+
+  if (Array.isArray(payload?.data?.list)) return payload.data.list;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.list)) return payload.list;
+  return [];
 }
 
 function normalizeIncomeItem(item, date) {
@@ -549,18 +571,20 @@ async function hydrateIncomeForecasts(resources, checkedAt) {
       resource.incomeForecast = cached || {
         date: today,
         status: "error",
-        error: error.message || "????????",
+        error: error.message || "收益预估失败",
         updatedAt
       };
       items[resource.uuid] = resource.incomeForecast;
     }
   }));
 
+  const forecastHistory = mergeForecastHistory(forecastState.history, forecastState.date, forecastState.items);
   forecastState = normalizeForecastState({
     version: FORECAST_VERSION,
     date: today,
     updatedAt,
-    items
+    items,
+    history: mergeForecastHistory(forecastHistory, today, items)
   });
   await persistForecastState();
 }
@@ -615,20 +639,30 @@ async function buildIncomeForecast(resource, checkedAt, dates, incomeHistory, op
     }
 
     try {
-      const range = getShanghaiDayRange(date);
-      const series = await fetchResourceMonitorSeries(resource.uuid, range.start, range.end, {
-        ...config.monitorSeries,
-        maxPoints: options.maxMonitorPoints
-      });
-      const p95Mbps = billingP95(series.map((point) => point.flowMbps));
-      const p95FlowGb = round(p95Mbps / 1000, 3);
+      const historicalForecast = getHistoricalForecast(resource.uuid, date);
+      let p95FlowGb = readForecastRawFlowGb(historicalForecast);
+      if (!p95FlowGb) {
+        const range = getShanghaiDayRange(date);
+        const series = await fetchResourceMonitorSeries(resource.uuid, range.start, range.end, {
+          ...config.monitorSeries,
+          maxPoints: options.maxMonitorPoints
+        });
+        const p95Mbps = billingP95(series.map((point) => point.flowMbps));
+        p95FlowGb = round(p95Mbps / 1000, 3);
+      }
       if (p95FlowGb <= 0 || incomeItem.flowGb <= 0) continue;
+      const forecastScale = historicalForecast?.estimatedSettlementFlowGb > 0
+        ? incomeItem.flowGb / historicalForecast.estimatedSettlementFlowGb
+        : 0;
       samples.push({
         date,
         p95FlowGb,
         settlementFlowGb: incomeItem.flowGb,
         incomeYuan: incomeItem.incomeYuan,
-        unitPriceYuanPerGb: incomeItem.incomeYuan / incomeItem.flowGb
+        unitPriceYuanPerGb: incomeItem.incomeYuan / incomeItem.flowGb,
+        flowScale: incomeItem.flowGb / p95FlowGb,
+        forecastScale,
+        source: historicalForecast ? "forecast" : "monitor"
       });
     } catch {
       // A missing historical curve should not block today's estimate.
@@ -641,8 +675,19 @@ async function buildIncomeForecast(resource, checkedAt, dates, incomeHistory, op
   if (!unitPriceYuanPerGb) return null;
 
   const todayP95FlowGb = round(todayP95Mbps / 1000, 3);
-  const estimatedSettlementFlowGb = todayP95FlowGb;
+  const rawFlowScale = weightedAverage(
+    samples.map((sample) => ({ value: sample.flowScale, weight: sample.settlementFlowGb }))
+  );
+  const flowScale = normalizeForecastFlowScale(rawFlowScale || 1, options);
+  const forecastAccuracyScale = weightedAverage(
+    samples
+      .filter((sample) => sample.source === "forecast")
+      .map((sample) => ({ value: sample.forecastScale, weight: sample.settlementFlowGb }))
+  );
+  const estimatedSettlementFlowGb = round(todayP95FlowGb * flowScale, 3);
   const estimatedIncomeYuan = round(estimatedSettlementFlowGb * unitPriceYuanPerGb, 2);
+  const forecastSampleCount = samples.filter((sample) => sample.source === "forecast").length;
+  const monitorSampleCount = samples.length - forecastSampleCount;
 
   return {
     date: today,
@@ -653,16 +698,23 @@ async function buildIncomeForecast(resource, checkedAt, dates, incomeHistory, op
     todayP95Mbps: round(todayP95Mbps, 2),
     todayP95FlowGb,
     unitPriceYuanPerGb: round(unitPriceYuanPerGb, 2),
-    flowScale: 1,
+    flowScale,
+    rawFlowScale: round(rawFlowScale || 1, 4),
+    forecastAccuracyScale: round(forecastAccuracyScale || 0, 4),
+    rawEstimatedSettlementFlowGb: todayP95FlowGb,
     sampleCount: samples.length,
+    forecastSampleCount,
+    monitorSampleCount,
     fallbackPriceCount: fallbackPrices.length,
     historyDates: samples.map((sample) => sample.date),
+    adjustmentDates: samples.map((sample) => sample.date),
     pointCount: todaySeries.length
   };
 }
 
-async function runCheck() {
+async function runCheck({ forceBackfill = false } = {}) {
   const checkedAt = new Date().toISOString();
+  const previousLastRun = state.lastRun;
   let snapshot;
   try {
     const response = await fetchTarget(config.target);
@@ -724,7 +776,7 @@ async function runCheck() {
   state.lastRun = checkedAt;
   state.latest = snapshot;
   state.activeAlerts = alerts;
-  history = [snapshot, ...history].slice(0, Number(config.schedule?.historyLimit || 100));
+  history = trimHistory([snapshot, ...history]);
 
   for (const alert of alerts) {
     await maybeSendAlert(alert, snapshot);
@@ -733,11 +785,206 @@ async function runCheck() {
   await writeJson(HISTORY_PATH, history);
   await writeJson(STATE_PATH, state);
   await publish();
+  queueMonitorHistoryBackfill(snapshot.resources || [], checkedAt, {
+    force: forceBackfill,
+    previousLastRun
+  });
   return snapshot;
 }
 
+function queueMonitorHistoryBackfill(resources = [], checkedAt, options = {}) {
+  void (async () => {
+    const result = await maybeBackfillMonitorHistory(resources, checkedAt, options);
+    if (!result?.attempted) return;
+    if (state.latest?.checkedAt === checkedAt) {
+      state.latest.metrics ||= {};
+      state.latest.metrics.historyBackfill = {
+        ok: result.ok,
+        points: result.points,
+        resources: result.resources,
+        error: result.error || null
+      };
+    }
+    await writeJson(HISTORY_PATH, history);
+    await writeJson(STATE_PATH, state);
+    await publish();
+  })().catch((error) => {
+    console.error(`历史流量后台补采失败: ${error.message}`);
+  });
+}
+
+async function maybeBackfillMonitorHistory(resources = [], checkedAt, { force = false, previousLastRun = null } = {}) {
+  const options = normalizeHistoryBackfillOptions(config.historyBackfill);
+  const shouldBackfill = shouldBackfillOnStartupOrGap(options, checkedAt, previousLastRun);
+  const attempted = force || shouldBackfill;
+  if (!attempted) {
+    if (startupBackfillPending) startupBackfillPending = false;
+    return { attempted: false };
+  }
+  startupBackfillPending = false;
+  if (!options.enabled || backfillRunning || !process.env.MONITOR_COOKIE || !resources.length) {
+    return { attempted: true, ok: false, points: 0, resources: 0, error: "历史补采条件不足" };
+  }
+
+  backfillRunning = true;
+  try {
+    const endTime = new Date(checkedAt);
+    const startTime = new Date(endTime.getTime() - options.days * 24 * 60 * 60 * 1000);
+    const result = await buildMonitorBackfillSnapshot(resources, startTime, endTime, options);
+    if (!result.snapshot || !result.points) {
+      return { attempted: true, ok: false, points: 0, resources: 0, error: "最近 7 天没有可补采流量数据" };
+    }
+    history = mergeBackfillSnapshot(history, result.snapshot);
+    state.historyBackfill = {
+      tag: HISTORY_BACKFILL_TAG,
+      startAt: startTime.toISOString(),
+      endAt: endTime.toISOString(),
+      checkedAt,
+      days: options.days,
+      points: result.points,
+      resources: result.resources
+    };
+    return { attempted: true, ok: true, points: result.points, resources: result.resources };
+  } catch (error) {
+    state.historyBackfill = {
+      ...(state.historyBackfill || {}),
+      checkedAt,
+      error: error.message || "历史补采失败"
+    };
+    return { attempted: true, ok: false, points: 0, resources: 0, error: error.message || "历史补采失败" };
+  } finally {
+    backfillRunning = false;
+  }
+}
+
+function shouldBackfillOnStartupOrGap(options, checkedAt, previousLastRun) {
+  if (!options.enabled || !startupBackfillPending) return false;
+  if (!previousLastRun) return true;
+  const gapMs = Date.parse(checkedAt) - Date.parse(previousLastRun);
+  return !Number.isFinite(gapMs) || gapMs >= options.startupGapMinutes * 60 * 1000;
+}
+
+async function buildMonitorBackfillSnapshot(resources, startTime, endTime, options) {
+  const backfilledResources = [];
+  let pointCount = 0;
+
+  await Promise.all(resources.map(async (resource) => {
+    try {
+      const series = await fetchResourceMonitorSeries(resource.uuid, startTime, endTime, {
+        ...config.monitorSeries,
+        maxPoints: options.maxPointsPerNode
+      });
+      if (!series.length) return;
+      const normalizedSeries = normalizeBackfillSeries(series, startTime, endTime);
+      if (!normalizedSeries.length) return;
+      const latestPoint = normalizedSeries[normalizedSeries.length - 1];
+      pointCount += normalizedSeries.length;
+      backfilledResources.push({
+        ...resource,
+        currentFlowMbps: latestPoint.flowMbps,
+        currentFlowLabel: formatMbps(latestPoint.flowMbps),
+        bandwidthUsagePercent: percent(latestPoint.flowMbps, resource.bandwidthMbps),
+        flowSeries: normalizedSeries,
+        historyBackfilled: true
+      });
+    } catch (error) {
+      backfilledResources.push({
+        ...resource,
+        monitorError: error.message || "历史流量补采失败",
+        historyBackfilled: true
+      });
+    }
+  }));
+
+  if (!pointCount) return { snapshot: null, points: 0, resources: 0 };
+
+  const resourceSummary = summarizeResources(backfilledResources);
+  return {
+    points: pointCount,
+    resources: backfilledResources.filter((resource) => Array.isArray(resource.flowSeries) && resource.flowSeries.length).length,
+    snapshot: {
+      ok: true,
+      checkedAt: startTime.toISOString(),
+      target: { name: "历史流量补采", url: config.target.url },
+      metrics: {
+        historyBackfilled: true,
+        historyBackfillTag: HISTORY_BACKFILL_TAG,
+        historyBackfillStartAt: startTime.toISOString(),
+        historyBackfillEndAt: endTime.toISOString(),
+        historyBackfillDays: options.days,
+        historyBackfillPoints: pointCount,
+        resourceFetched: backfilledResources.length,
+        resourceDisplayed: backfilledResources.length,
+        totalFlowMbps: resourceSummary.totalFlowMbps,
+        totalBandwidthMbps: resourceSummary.totalBandwidthMbps,
+        bandwidthUsagePercent: resourceSummary.bandwidthUsagePercent
+      },
+      resources: backfilledResources,
+      alerts: [],
+      sample: "monitor history backfill",
+      historyBackfill: {
+        tag: HISTORY_BACKFILL_TAG,
+        startAt: startTime.toISOString(),
+        endAt: endTime.toISOString()
+      }
+    }
+  };
+}
+
+function normalizeBackfillSeries(series, startTime, endTime) {
+  const startMs = startTime.getTime();
+  const endMs = endTime.getTime();
+  const seen = new Set();
+  return series
+    .map((point) => {
+      const checkedAt = normalizeMonitorTime(point.checkedAt);
+      const timeMs = Date.parse(checkedAt);
+      if (!Number.isFinite(timeMs) || timeMs < startMs || timeMs > endMs) return null;
+      const key = new Date(timeMs).toISOString();
+      if (seen.has(key)) return null;
+      seen.add(key);
+      return {
+        checkedAt: key,
+        flowMbps: round(Number(point.flowMbps || 0), 2)
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => Date.parse(left.checkedAt) - Date.parse(right.checkedAt));
+}
+
+function mergeBackfillSnapshot(sourceHistory, backfillSnapshot) {
+  const next = [
+    backfillSnapshot,
+    ...sourceHistory.filter((snapshot) => snapshot?.historyBackfill?.tag !== HISTORY_BACKFILL_TAG)
+  ];
+  return trimHistory(next);
+}
+
+function trimHistory(items) {
+  const limit = Math.max(1, Number(config.schedule?.historyLimit || 100));
+  const backfillSnapshots = [];
+  const normalSnapshots = [];
+
+  for (const item of items.filter(Boolean)) {
+    if (item.historyBackfill?.tag === HISTORY_BACKFILL_TAG) backfillSnapshots.push(item);
+    else normalSnapshots.push(item);
+  }
+
+  const newestBackfill = backfillSnapshots
+    .sort((left, right) => Date.parse(right.historyBackfill?.endAt || right.checkedAt) - Date.parse(left.historyBackfill?.endAt || left.checkedAt))
+    .slice(0, 1);
+
+  return [
+    ...normalSnapshots
+      .sort((left, right) => Date.parse(right.checkedAt) - Date.parse(left.checkedAt))
+      .slice(0, limit),
+    ...newestBackfill
+  ].sort((left, right) => Date.parse(right.checkedAt) - Date.parse(left.checkedAt));
+}
+
 async function maybeSendAlert(rule, snapshot) {
-  if (!config.serverChan?.enabled) return;
+  const pushItem = rule.nodeUuid ? "nodeAlerts" : "systemAlerts";
+  if (!isServerChanPushEnabled(pushItem)) return;
   const cooldownMs = Math.max(0, Number(config.serverChan.cooldownSeconds || 0)) * 1000;
   const lastSent = state.lastEmailByRule?.[rule.id] || 0;
   if (Date.now() - lastSent < cooldownMs) return;
@@ -745,7 +992,7 @@ async function maybeSendAlert(rule, snapshot) {
     await sendServerChanAlert({ rule, metricValue: rule.actual ?? snapshot.metrics[rule.metric], snapshot });
     state.lastEmailByRule = { ...state.lastEmailByRule, [rule.id]: Date.now() };
   } catch (error) {
-    console.error(`Server?????: ${error.message}`);
+    console.error(`Server酱推送失败: ${error.message}`);
   }
 }
 
@@ -790,7 +1037,7 @@ function evaluateNodeAlerts(resources, checkedAt) {
         actual,
         thresholdPercent: threshold,
         severity: rule.severity || "warning",
-        message: `${resource.remark || resource.uuid} ? ${rule.time} ?????? ${threshold}%`,
+        message: `${resource.remark || resource.uuid} · ${rule.time} 流量低于 ${threshold}%`,
         triggeredAt: checkedAt,
         nodeUuid: resource.uuid,
         nodeRemark: resource.remark || "",
@@ -956,22 +1203,22 @@ function isNodeAlertMuted(mute, checkedAt) {
 }
 
 function formatResourceStatus(status, online, machineStatusMap) {
-  if (online === 0) return "??";
+  if (online === 0) return "离线";
   const labels = {
-    1: "???",
-    2: "??",
-    3: "???",
-    4: "???",
-    5: "???",
-    6: "?????",
-    31: "?????",
-    32: "????",
-    34: "??????",
-    35: "????",
-    39: "????",
-    40: "??????"
+    1: "运行中",
+    2: "离线",
+    3: "部署中",
+    4: "删除中",
+    5: "已删除",
+    6: "未真实部署",
+    31: "磁盘未挂载",
+    32: "连接失败",
+    34: "业务启动失败",
+    35: "部署超时",
+    39: "网络异常",
+    40: "磁盘空间不足"
   };
-  return labels[status] || machineStatusMap || `?? ${status ?? "-"}`;
+  return labels[status] || machineStatusMap || `状态 ${status ?? "-"}`;
 }
 
 function formatBandwidth(value) {
@@ -1028,6 +1275,16 @@ function weightedAverage(items) {
   return valid.reduce((sum, item) => sum + item.value * item.weight, 0) / weight;
 }
 
+function normalizeForecastFlowScale(value, options = {}) {
+  const number = Number(value);
+  const min = Number(options.minFlowScale ?? 0.5);
+  const max = Number(options.maxFlowScale ?? 1.05);
+  const lower = Number.isFinite(min) ? min : 0.5;
+  const upper = Number.isFinite(max) ? max : 1.05;
+  if (!Number.isFinite(number) || number <= 0) return 1;
+  return round(Math.min(Math.max(number, lower), upper), 4);
+}
+
 function coerce(value, type) {
   if (type === "number") return Number(value ?? 0);
   if (type === "boolean") {
@@ -1044,8 +1301,6 @@ function readPath(input, keyPath = "") {
 
 async function fetchTarget(target) {
   const started = Date.now();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Number(target.timeoutMs || 15000));
   const headers = {
     ...(target.headers || {}),
     ...(target.body ? { "Content-Type": "application/json" } : {}),
@@ -1053,29 +1308,70 @@ async function fetchTarget(target) {
     ...(process.env.MONITOR_USER_AGENT ? { "User-Agent": process.env.MONITOR_USER_AGENT } : {})
   };
 
-  try {
-    const response = await fetch(target.url, {
-      method: target.method || "GET",
-      headers,
-      body: target.body ? JSON.stringify(target.body) : undefined,
-      signal: controller.signal,
-      redirect: "follow"
-    });
-    return {
-      statusCode: response.status,
-      headers: Object.fromEntries(response.headers.entries()),
-      body: await response.text(),
-      responseTimeMs: Date.now() - started
-    };
-  } finally {
-    clearTimeout(timeout);
+  const response = await fetchWithRetry(target.url, {
+    method: target.method || "GET",
+    headers,
+    body: target.body ? JSON.stringify(target.body) : undefined,
+    redirect: "follow"
+  }, {
+    timeoutMs: Number(target.timeoutMs || 15000),
+    label: target.name || "目标接口"
+  });
+  return {
+    statusCode: response.status,
+    headers: Object.fromEntries(response.headers.entries()),
+    body: await response.text(),
+    responseTimeMs: Date.now() - started
+  };
+}
+
+async function fetchWithRetry(url, options = {}, {
+  timeoutMs = 15000,
+  retries = 2,
+  retryDelayMs = 500,
+  label = "请求"
+} = {}) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, {
+        ...options,
+        signal: controller.signal
+      });
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retries) {
+        throw new Error(formatFetchFailure(error, label));
+      }
+      await delay(retryDelayMs * (attempt + 1));
+    } finally {
+      clearTimeout(timeout);
+    }
   }
+  throw new Error(formatFetchFailure(lastError, label));
+}
+
+function formatFetchFailure(error, label) {
+  if (error?.name === "AbortError") return `${label}超时`;
+  const cause = error?.cause;
+  const details = [
+    error?.message,
+    cause?.code,
+    cause?.message
+  ].filter(Boolean);
+  return `${label}失败${details.length ? `：${details.join(" / ")}` : ""}`;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function hydrateResourceMonitorSeries(resources, options = {}) {
   if (!options.enabled || !resources.length) return;
   const endTime = new Date();
-  const startTime = new Date(Date.now() - Math.max(5, Number(options.lookbackMinutes || 60)) * 60 * 1000);
+  const startTime = new Date(Date.now() - Math.max(5, Number(options.lookbackMinutes || 1440)) * 60 * 1000);
   await Promise.all(resources.map(async (resource) => {
     try {
       const series = await fetchResourceMonitorSeries(resource.uuid, startTime, endTime, options);
@@ -1094,19 +1390,23 @@ async function fetchResourceMonitorSeries(uuid, startTime, endTime, options = {}
   const url = new URL(`https://cloud.tingyutech.com/api/jusha/machine/monitor/${encodeURIComponent(uuid)}`);
   url.searchParams.set("startTime", startTime.toISOString());
   url.searchParams.set("endTime", endTime.toISOString());
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     headers: {
       "Accept": "application/json,text/plain,*/*",
-      "Referer": "https://cloud.tingyutech.com/jusha/resource/all",
+      "Referer": `https://cloud.tingyutech.com/jusha/resource/all/detail/${encodeURIComponent(uuid)}`,
       ...(process.env.MONITOR_COOKIE ? { Cookie: process.env.MONITOR_COOKIE } : {}),
       ...(process.env.MONITOR_USER_AGENT ? { "User-Agent": process.env.MONITOR_USER_AGENT } : {})
     }
+  }, {
+    timeoutMs: Number(config.target?.timeoutMs || 15000),
+    retries: 1,
+    label: "流量曲线接口"
   });
   const payload = await response.json();
   if (!response.ok || payload.success === false) {
     throw new Error(payload.message || `monitor api ${response.status}`);
   }
-  return normalizeMonitorSeries(payload.data ?? payload, Number(options.maxPoints || 30));
+  return normalizeMonitorSeries(payload.data ?? payload, Number(options.maxPoints || 288));
 }
 
 function normalizeMonitorSeries(payload, maxPoints) {
@@ -1150,11 +1450,28 @@ function toFlowSeries(items) {
       ]);
       if (flow === null) return null;
       return {
-        checkedAt: String(readFirstValue(item, ["createTime", "time", "timestamp", "date", "createdAt", "reportCreateTime"]) ?? index),
+        checkedAt: normalizeMonitorTime(readFirstValue(item, ["createTime", "time", "timestamp", "date", "createdAt", "reportCreateTime"]) ?? index),
         flowMbps: round(flow, 2)
       };
     })
     .filter(Boolean);
+}
+
+function normalizeMonitorTime(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString();
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const millis = value > 10_000_000_000 ? value : value * 1000;
+    return new Date(millis).toISOString();
+  }
+  const text = String(value ?? "").trim();
+  if (/^\d{10}$/.test(text)) return new Date(Number(text) * 1000).toISOString();
+  if (/^\d{13}$/.test(text)) return new Date(Number(text)).toISOString();
+  const normalized = text.includes(" ") && !/[zZ]|[+-]\d{2}:?\d{2}$/.test(text)
+    ? `${text.replace(" ", "T")}+08:00`
+    : text;
+  const date = new Date(normalized);
+  if (!Number.isNaN(date.getTime())) return date.toISOString();
+  return text;
 }
 
 function readFirstNumber(item, keys) {
@@ -1222,22 +1539,22 @@ async function sendAlertEmail({ rule, metricValue, snapshot }, force = false) {
   const smtp = readSmtpEnv();
   if (!force && !config.email?.enabled) return;
   if (!smtp.host || !smtp.from || !smtp.to) {
-    throw new Error("SMTP ????????? .env.example ?? SMTP_HOST?ALERT_FROM?ALERT_TO");
+    throw new Error("SMTP 配置不完整，请检查 .env.example 中的 SMTP_HOST、ALERT_FROM、ALERT_TO");
   }
 
-  const subject = `${config.email?.subjectPrefix || "[??]"} ${rule.message}`;
+  const subject = `${config.email?.subjectPrefix || "[报警]"} ${rule.message}`;
   const body = [
-    `??: ${rule.id}`,
-    `??: ${rule.severity || "warning"}`,
-    `??: ${snapshot.target.name} ${snapshot.target.url}`,
-    `??: ${snapshot.checkedAt}`,
-    `??: ${rule.metric || "test"} = ${metricValue}`,
+    `规则: ${rule.id}`,
+    `级别: ${rule.severity || "warning"}`,
+    `目标: ${snapshot.target.name} ${snapshot.target.url}`,
+    `时间: ${snapshot.checkedAt}`,
+    `指标: ${rule.metric || "test"} = ${metricValue}`,
     "",
-    "????:",
+    "当前指标:",
     JSON.stringify(snapshot.metrics || {}, null, 2),
     "",
-    "????:",
-    snapshot.sample || "(?)"
+    "页面片段:",
+    snapshot.sample || "(无)"
   ].join("\r\n");
 
   await smtpSend({
@@ -1260,7 +1577,7 @@ async function sendServerChanAlert({ rule, metricValue, snapshot }, force = fals
 async function postServerChanMessage(title, desp) {
   const sendKey = process.env.SERVERCHAN_SENDKEY;
   if (!sendKey) {
-    throw new Error("Server? SendKey ???");
+    throw new Error("Server酱 SendKey 未配置");
   }
 
   const url = `https://sctapi.ftqq.com/${encodeURIComponent(sendKey)}.send`;
@@ -1273,7 +1590,7 @@ async function postServerChanMessage(title, desp) {
   let payload = {};
   try { payload = JSON.parse(text); } catch {}
   if (!response.ok || (payload.code !== undefined && Number(payload.code) !== 0)) {
-    throw new Error(payload.message || payload.info || text || `Server????? ${response.status}`);
+    throw new Error(payload.message || payload.info || text || `Server酱推送失败 ${response.status}`);
   }
 }
 
@@ -1281,16 +1598,16 @@ function buildNodeServerChanMessage(rule, snapshot) {
   const currentFlow = rule.currentFlowLabel || formatMbps(rule.currentFlowMbps || 0);
   const ruleText = formatNodeAlertRule(rule);
   return [
-    `### ??????`,
+    `### 聚沙报警`,
     "",
-    `- ????: ${rule.nodeRemark || rule.nodeUuid}`,
-    `- ????: ${ruleText}`,
-    `- ????: ${currentFlow}`,
-    `- ????: ${formatPercentText(rule.bandwidthUsagePercent ?? rule.actual)}%`,
-    `- ????: ${snapshot.checkedAt}`,
+    `- 节点名称: ${rule.nodeRemark || rule.nodeUuid}`,
+    `- 报警规则: ${ruleText}`,
+    `- 目前流量: ${currentFlow}`,
+    `- 当前占比: ${formatPercentText(rule.bandwidthUsagePercent ?? rule.actual)}%`,
+    `- 触发时间: ${snapshot.checkedAt}`,
     `- UUID: ${rule.nodeUuid}`,
     "",
-    `????: ${rule.message}`
+    `报警内容: ${rule.message}`
   ].join("\n");
 }
 
@@ -1298,13 +1615,13 @@ function buildGenericServerChanMessage(rule, metricValue, snapshot) {
   return [
     `### ${rule.message}`,
     "",
-    `- ??: ${rule.id}`,
-    `- ??: ${rule.severity || "warning"}`,
-    `- ??: ${snapshot.target.name}`,
-    `- ??: ${snapshot.checkedAt}`,
-    `- ??: ${rule.metric || "test"} = ${metricValue}`,
+    `- 规则: ${rule.id}`,
+    `- 级别: ${rule.severity || "warning"}`,
+    `- 目标: ${snapshot.target.name}`,
+    `- 时间: ${snapshot.checkedAt}`,
+    `- 指标: ${rule.metric || "test"} = ${metricValue}`,
     "",
-    "#### ????",
+    "#### 当前指标",
     "```json",
     JSON.stringify(snapshot.metrics || {}, null, 2),
     "```"
@@ -1313,7 +1630,7 @@ function buildGenericServerChanMessage(rule, metricValue, snapshot) {
 
 function formatNodeAlertRule(rule) {
   if (rule.type === "time_percent_below") {
-    return `${rule.time || "--:--"} ?????? ${formatPercentText(rule.thresholdPercent)}%`;
+    return `${rule.time || "--:--"} 流量低于 ${formatPercentText(rule.thresholdPercent)}%`;
   }
   return rule.message || rule.ruleId || rule.id;
 }
@@ -1502,6 +1819,7 @@ function getPublicServerChanSettings() {
     enabled: Boolean(config.serverChan?.enabled),
     cooldownSeconds: Number(config.serverChan?.cooldownSeconds || 0),
     subjectPrefix: config.serverChan?.subjectPrefix || "[Resource Monitor Alert]",
+    pushItems: normalizeServerChanPushItems(config.serverChan?.pushItems),
     hasSendKey: Boolean(process.env.SERVERCHAN_SENDKEY),
     sendKeyPreview: maskSecret(process.env.SERVERCHAN_SENDKEY || "")
   };
@@ -1597,6 +1915,7 @@ function normalizeConfig(value = {}) {
   const retryIntervalMinutes = Number(income.retryIntervalMinutes ?? 15);
   const billType = Number(income.billType ?? 0);
   const taxRate = normalizeTaxRate(income.taxRate ?? income.tax ?? 0.06);
+  const monthlyFixedExpenseYuan = normalizeMoneyYuan(income.monthlyFixedExpenseYuan ?? income.fixedExpenseYuan ?? 0);
 
   return {
     ...source,
@@ -1605,10 +1924,57 @@ function normalizeConfig(value = {}) {
       startTime: normalizeHm(income.startTime) || "06:30",
       retryIntervalMinutes: Number.isFinite(retryIntervalMinutes) ? Math.max(1, retryIntervalMinutes) : 15,
       billType: Number.isFinite(billType) ? billType : 0,
-      taxRate
+      taxRate,
+      monthlyFixedExpenseYuan
     },
-    incomeForecast: normalizeIncomeForecastOptions(source.incomeForecast)
+    monitorSeries: normalizeMonitorSeriesOptions(source.monitorSeries),
+    historyBackfill: normalizeHistoryBackfillOptions(source.historyBackfill),
+    incomeForecast: normalizeIncomeForecastOptions(source.incomeForecast),
+    serverChan: normalizeServerChanConfig(source.serverChan)
   };
+}
+
+function normalizeMonitorSeriesOptions(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  const lookbackMinutes = Number(source.lookbackMinutes ?? 1440);
+  const maxPoints = Number(source.maxPoints ?? 288);
+  return {
+    ...source,
+    enabled: source.enabled !== false,
+    lookbackMinutes: Number.isFinite(lookbackMinutes)
+      ? Math.min(7 * 24 * 60, Math.max(5, Math.round(lookbackMinutes)))
+      : 1440,
+    maxPoints: Number.isFinite(maxPoints)
+      ? Math.min(5000, Math.max(1, Math.round(maxPoints)))
+      : 288
+  };
+}
+
+function normalizeServerChanConfig(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  const cooldownSeconds = Number(source.cooldownSeconds ?? 600);
+  return {
+    ...source,
+    enabled: source.enabled !== false,
+    cooldownSeconds: Number.isFinite(cooldownSeconds) ? Math.max(0, cooldownSeconds) : 600,
+    subjectPrefix: String(source.subjectPrefix || "[聚沙]"),
+    pushItems: normalizeServerChanPushItems(source.pushItems)
+  };
+}
+
+function normalizeServerChanPushItems(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    systemAlerts: source.systemAlerts !== false,
+    nodeAlerts: source.nodeAlerts !== false,
+    incomeSummary: source.incomeSummary !== false
+  };
+}
+
+function isServerChanPushEnabled(key) {
+  if (!config.serverChan?.enabled) return false;
+  const pushItems = normalizeServerChanPushItems(config.serverChan?.pushItems);
+  return pushItems[key] !== false;
 }
 
 function sendJson(res, payload, status = 200) {
@@ -1697,6 +2063,10 @@ function normalizeIncomeState(value = {}) {
 function normalizeIncomeMonth(value = null) {
   if (!value || typeof value !== "object") return null;
   const taxRate = normalizeTaxRate(value.taxRate ?? config.income?.taxRate ?? 0.06);
+  const monthlyFixedExpenseYuan = normalizeMoneyYuan(
+    value.monthlyFixedExpenseYuan ?? value.fixedExpenseYuan ?? config.income?.monthlyFixedExpenseYuan ?? 0
+  );
+  const monthlyFixedExpenseCents = Math.round(monthlyFixedExpenseYuan * 100);
   const totalIncomeCents = Number.isFinite(Number(value.totalIncomeCents))
     ? Math.round(Number(value.totalIncomeCents))
     : Math.round(Number(value.totalIncomeYuan || value.grossIncomeYuan || 0) * 100);
@@ -1706,6 +2076,7 @@ function normalizeIncomeMonth(value = null) {
   const netIncomeCents = Number.isFinite(Number(value.netIncomeCents))
     ? Math.round(Number(value.netIncomeCents))
     : Math.max(0, totalIncomeCents - taxCents);
+  const netProfitCents = netIncomeCents - monthlyFixedExpenseCents;
 
   return {
     month: value.month || String(value.endDate || value.date || "").slice(0, 7) || null,
@@ -1722,6 +2093,10 @@ function normalizeIncomeMonth(value = null) {
     taxYuan: round(taxCents / 100, 2),
     netIncomeCents,
     netIncomeYuan: round(netIncomeCents / 100, 2),
+    monthlyFixedExpenseCents,
+    monthlyFixedExpenseYuan,
+    netProfitCents,
+    netProfitYuan: round(netProfitCents / 100, 2),
     failedDates: Array.isArray(value.failedDates)
       ? value.failedDates.map((item) => ({
         date: String(item.date || ""),
@@ -1736,6 +2111,12 @@ function normalizeTaxRate(value) {
   if (!Number.isFinite(number)) return 0.06;
   if (number > 1) return Math.min(1, Math.max(0, number / 100));
   return Math.min(1, Math.max(0, number));
+}
+
+function normalizeMoneyYuan(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return round(Math.max(0, number), 2);
 }
 
 function normalizeIncomeNotification(value = {}) {
@@ -1757,7 +2138,8 @@ function normalizeForecastState(value = {}) {
     version: Number(value.version || 0),
     date: value.date || null,
     updatedAt: value.updatedAt || null,
-    items
+    items,
+    history: normalizeForecastHistory(value.history)
   };
 }
 
@@ -1769,15 +2151,71 @@ function normalizeForecastItem(item = {}) {
     updatedAt: item.updatedAt || null,
     estimatedIncomeYuan: round(Number(item.estimatedIncomeYuan || 0), 2),
     estimatedSettlementFlowGb: round(Number(item.estimatedSettlementFlowGb || 0), 3),
+    rawEstimatedSettlementFlowGb: round(Number(item.rawEstimatedSettlementFlowGb || item.todayP95FlowGb || 0), 3),
     todayP95Mbps: round(Number(item.todayP95Mbps || 0), 2),
     todayP95FlowGb: round(Number(item.todayP95FlowGb || 0), 3),
     unitPriceYuanPerGb: round(Number(item.unitPriceYuanPerGb || 0), 2),
-    flowScale: round(Number(item.flowScale || 0), 4),
+    flowScale: round(Number(item.flowScale || 1), 4),
+    rawFlowScale: round(Number(item.rawFlowScale || item.flowScale || 1), 4),
+    forecastAccuracyScale: round(Number(item.forecastAccuracyScale || 0), 4),
     sampleCount: Math.max(0, Number(item.sampleCount || 0)),
+    forecastSampleCount: Math.max(0, Number(item.forecastSampleCount || 0)),
+    monitorSampleCount: Math.max(0, Number(item.monitorSampleCount || 0)),
     fallbackPriceCount: Math.max(0, Number(item.fallbackPriceCount || 0)),
     historyDates: Array.isArray(item.historyDates) ? item.historyDates.map(String) : [],
+    adjustmentDates: Array.isArray(item.adjustmentDates) ? item.adjustmentDates.map(String) : [],
     pointCount: Math.max(0, Number(item.pointCount || 0)),
     error: item.error || null
+  };
+}
+
+function normalizeForecastHistory(value = {}) {
+  const history = {};
+  for (const [date, items] of Object.entries(value || {})) {
+    const normalizedItems = {};
+    for (const [uuid, item] of Object.entries(items || {})) {
+      const normalized = normalizeForecastItem(item);
+      if (normalized) normalizedItems[uuid] = normalized;
+    }
+    if (Object.keys(normalizedItems).length) history[date] = normalizedItems;
+  }
+  return history;
+}
+
+function mergeForecastHistory(sourceHistory = {}, date, items = {}) {
+  const next = normalizeForecastHistory(sourceHistory);
+  const normalizedItems = {};
+  for (const [uuid, item] of Object.entries(items || {})) {
+    const normalized = normalizeForecastItem(item);
+    if (normalized) normalizedItems[uuid] = normalized;
+  }
+  if (date && Object.keys(normalizedItems).length) next[date] = normalizedItems;
+  const entries = Object.entries(next)
+    .sort(([left], [right]) => right.localeCompare(left))
+    .slice(0, 14);
+  return Object.fromEntries(entries);
+}
+
+function getHistoricalForecast(uuid, date) {
+  if (forecastState.date === date && forecastState.items?.[uuid]) return forecastState.items[uuid];
+  return forecastState.history?.[date]?.[uuid] || null;
+}
+
+function readForecastRawFlowGb(item) {
+  const value = Number(item?.rawEstimatedSettlementFlowGb || item?.todayP95FlowGb || 0);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function normalizeHistoryBackfillOptions(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  const days = Number(source.days ?? 7);
+  const maxPointsPerNode = Number(source.maxPointsPerNode ?? 2500);
+  const startupGapMinutes = Number(source.startupGapMinutes ?? 10);
+  return {
+    enabled: source.enabled !== false,
+    days: Number.isFinite(days) ? Math.min(14, Math.max(1, Math.round(days))) : 7,
+    maxPointsPerNode: Number.isFinite(maxPointsPerNode) ? Math.min(5000, Math.max(96, Math.round(maxPointsPerNode))) : 2500,
+    startupGapMinutes: Number.isFinite(startupGapMinutes) ? Math.max(1, startupGapMinutes) : 10
   };
 }
 
@@ -1786,11 +2224,15 @@ function normalizeIncomeForecastOptions(value = {}) {
   const historyDays = Number(source.historyDays ?? 5);
   const refreshMinutes = Number(source.refreshMinutes ?? 30);
   const maxMonitorPoints = Number(source.maxMonitorPoints ?? 500);
+  const minFlowScale = Number(source.minFlowScale ?? 0.5);
+  const maxFlowScale = Number(source.maxFlowScale ?? 1.05);
   return {
     enabled: source.enabled !== false,
     historyDays: Number.isFinite(historyDays) ? Math.min(14, Math.max(1, Math.round(historyDays))) : 5,
     refreshMinutes: Number.isFinite(refreshMinutes) ? Math.max(5, refreshMinutes) : 30,
-    maxMonitorPoints: Number.isFinite(maxMonitorPoints) ? Math.min(1200, Math.max(96, Math.round(maxMonitorPoints))) : 500
+    maxMonitorPoints: Number.isFinite(maxMonitorPoints) ? Math.min(1200, Math.max(96, Math.round(maxMonitorPoints))) : 500,
+    minFlowScale: Number.isFinite(minFlowScale) ? Math.min(1, Math.max(0.1, minFlowScale)) : 0.5,
+    maxFlowScale: Number.isFinite(maxFlowScale) ? Math.min(1.5, Math.max(0.5, maxFlowScale)) : 1.05
   };
 }
 

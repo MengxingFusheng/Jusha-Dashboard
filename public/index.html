@@ -10,36 +10,36 @@
     <header class="topbar">
       <div class="topbar-login">
         <form id="loginForm" class="login-form compact-login">
-          <input id="loginUsername" name="username" type="text" autocomplete="username" placeholder="??">
-          <input id="loginPassword" name="password" type="password" autocomplete="current-password" placeholder="??">
-          <button id="loginButton" type="submit">??</button>
+          <input id="loginUsername" name="username" type="text" autocomplete="username" placeholder="账号">
+          <input id="loginPassword" name="password" type="password" autocomplete="current-password" placeholder="密码">
+          <button id="loginButton" type="submit">登录</button>
         </form>
         <div class="topbar-login-status">
-          <span id="cookieBadge" class="badge muted">??? Cookie</span>
+          <span id="cookieBadge" class="badge muted">未保存 Cookie</span>
           <span id="loginMessage"></span>
         </div>
       </div>
 
       <div class="topbar-title">
         <h1>Dash Board</h1>
-        <p id="targetLabel" class="sr-only">????????...</p>
+        <p id="targetLabel" class="sr-only">正在读取监控状态...</p>
       </div>
 
       <div class="actions">
-        <span id="runStatus" class="badge muted">????</span>
-        <span id="lastRun" class="badge muted">???? -</span>
+        <span id="runStatus" class="badge muted">等待首检</span>
+        <span id="lastRun" class="badge muted">最近检查 -</span>
         <label class="frequency-control">
-          <span>????</span>
+          <span>采集频率</span>
           <select id="intervalSeconds">
-            <option value="10">10 ?</option>
-            <option value="30">30 ?</option>
-            <option value="60">1 ??</option>
-            <option value="120">2 ??</option>
-            <option value="300">5 ??</option>
-            <option value="600">10 ??</option>
+            <option value="10">10 秒</option>
+            <option value="30">30 秒</option>
+            <option value="60">1 分钟</option>
+            <option value="120">2 分钟</option>
+            <option value="300">5 分钟</option>
+            <option value="600">10 分钟</option>
           </select>
         </label>
-        <button id="checkNow" type="button">????</button>
+        <button id="checkNow" type="button">立即检查</button>
       </div>
     </header>
 
@@ -47,11 +47,11 @@
       <section class="panel resource-panel">
         <div class="panel-head">
           <div class="panel-title-block">
-            <h2>??????</h2>
-            <span id="resourceCount" class="badge muted">0 ?</span>
-            <label class="tile-scale-control" title="????????">
-              <span>??</span>
-              <input id="resourceTileScale" type="range" min="0.85" max="1.3" step="0.05" value="1" aria-label="??????">
+            <h2>节点流量监控</h2>
+            <span id="resourceCount" class="badge muted">0 条</span>
+            <label class="tile-scale-control" title="调整节点磁贴大小">
+              <span>大小</span>
+              <input id="resourceTileScale" type="range" min="0.85" max="1.3" step="0.05" value="1" aria-label="节点磁贴大小">
               <output id="resourceTileScaleValue">100%</output>
             </label>
           </div>
@@ -63,16 +63,24 @@
       <section class="panel income-panel">
         <div class="panel-head">
           <div class="panel-title-block">
-            <h2>??</h2>
-            <span id="incomeBadge" class="badge muted">??????</span>
-            <label class="tile-scale-control" title="????????">
-              <span>??</span>
-              <input id="incomeTileScale" type="range" min="0.85" max="1.3" step="0.05" value="1" aria-label="??????">
+            <h2>收益</h2>
+            <span id="incomeBadge" class="badge muted">收益未读取</span>
+            <label class="tile-scale-control" title="调整收益磁贴大小">
+              <span>大小</span>
+              <input id="incomeTileScale" type="range" min="0.85" max="1.3" step="0.05" value="1" aria-label="收益磁贴大小">
               <output id="incomeTileScaleValue">100%</output>
             </label>
           </div>
           <div class="actions compact">
-            <button id="incomeCheckNow" type="button">??????</button>
+            <label class="income-header-expense">
+              <span>每月固定支出</span>
+              <div class="income-expense-input compact">
+                <span>¥</span>
+                <input id="monthlyFixedExpenseYuan" type="number" min="0" step="0.01" inputmode="decimal" value="0" aria-label="每月固定支出">
+                <button type="button" class="expense-save-button" data-action="save-fixed-expense">保存</button>
+              </div>
+            </label>
+            <button id="incomeCheckNow" type="button">检查收益</button>
           </div>
         </div>
         <div id="incomeSummary" class="income-summary"></div>
@@ -83,12 +91,12 @@
         <section id="nodeAlertPanel" class="panel node-alert-panel">
           <div class="panel-head">
             <div>
-              <h2>????</h2>
-              <p id="selectedNodeLabel" class="subtle">???????</p>
+              <h2>报警设置</h2>
+              <p id="selectedNodeLabel" class="subtle">请选择一个节点</p>
             </div>
             <div class="actions compact">
-              <button id="addNodeAlert" type="button">????</button>
-              <button id="saveNodeAlerts" type="button">????</button>
+              <button id="addNodeAlert" type="button">新增报警</button>
+              <button id="saveNodeAlerts" type="button">保存报警</button>
             </div>
           </div>
           <div id="nodeAlertList" class="node-alert-list"></div>
@@ -97,10 +105,10 @@
 
         <section class="panel">
           <div class="panel-head">
-            <h2>????</h2>
+            <h2>报警日志</h2>
             <div class="actions compact">
-              <span id="alertCount" class="badge muted">0 ?</span>
-              <button id="clearAlertLogs" type="button" class="ghost-button danger">????</button>
+              <span id="alertCount" class="badge muted">0 条</span>
+              <button id="clearAlertLogs" type="button" class="ghost-button danger">清除全部</button>
             </div>
           </div>
           <div id="alertLogs" class="alert-list"></div>
@@ -110,28 +118,60 @@
       <section class="workspace single-row">
         <section class="panel serverchan-panel">
           <div class="panel-head">
-            <h2>Server???</h2>
+            <h2>Server酱推送</h2>
             <div class="actions compact">
-              <span id="serverChanBadge" class="badge muted">?????</span>
-              <button id="testServerChan" type="button">????</button>
-              <button id="saveServerChanSettings" type="button">????</button>
+              <span id="serverChanBadge" class="badge muted">推送未启用</span>
+              <button id="testServerChan" type="button">测试推送</button>
+              <button id="saveServerChanSettings" type="button">保存推送</button>
             </div>
           </div>
           <form id="serverChanForm" class="email-form">
             <label class="switch-row">
-              <span>?? Server???</span>
+              <span>启用 Server酱报警</span>
               <input id="serverChanEnabled" type="checkbox">
             </label>
+            <fieldset class="push-options">
+              <legend>可推送项目</legend>
+              <div class="push-card-grid">
+                <label class="push-card">
+                  <input type="checkbox" data-serverchan-push-item="nodeAlerts">
+                  <span class="push-card-icon" aria-hidden="true">流</span>
+                  <span class="push-card-copy">
+                    <strong>节点流量报警</strong>
+                    <small>磁贴内设置的节点报警触发时推送</small>
+                  </span>
+                  <span class="push-card-switch" aria-hidden="true"></span>
+                </label>
+                <label class="push-card">
+                  <input type="checkbox" data-serverchan-push-item="incomeSummary">
+                  <span class="push-card-icon income" aria-hidden="true">收</span>
+                  <span class="push-card-copy">
+                    <strong>收益通知</strong>
+                    <small>每日收益、本月税后收益和净利润推送</small>
+                  </span>
+                  <span class="push-card-switch" aria-hidden="true"></span>
+                </label>
+                <label class="push-card">
+                  <input type="checkbox" data-serverchan-push-item="systemAlerts">
+                  <span class="push-card-icon system" aria-hidden="true">基</span>
+                  <span class="push-card-copy">
+                    <strong>基础监控报警</strong>
+                    <small>接口异常、资源为空等系统规则推送</small>
+                  </span>
+                  <span class="push-card-switch" aria-hidden="true"></span>
+                </label>
+              </div>
+            </fieldset>
             <label>
               <span>SendKey</span>
-              <input id="serverChanSendKey" type="password" autocomplete="new-password" placeholder="???????? SendKey">
+              <input id="serverChanSendKey" type="password" autocomplete="new-password" placeholder="填写或替换 SendKey">
             </label>
             <label>
-              <span>??????</span>
+              <span>推送标题前缀</span>
               <input id="subjectPrefix" type="text" placeholder="[Resource Monitor Alert]">
             </label>
             <label>
-              <span>???????</span>
+              <span>冷却时间（秒）</span>
               <input id="cooldownSeconds" type="number" min="0" step="1">
             </label>
           </form>
