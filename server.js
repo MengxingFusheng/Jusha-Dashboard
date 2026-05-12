@@ -62,6 +62,7 @@ const server = http.createServer(async (req, res) => {
     if (req.url === "/api/serverchan-settings" && req.method === "POST") return updateServerChanSettings(req, res);
     if (req.url === "/api/check" && req.method === "POST") return runCheckEndpoint(res);
     if (req.url === "/api/income/check" && req.method === "POST") return runIncomeEndpoint(res);
+    if (req.url === "/api/income/push" && req.method === "POST") return pushIncomeEndpoint(res);
     if (req.url === "/api/test-serverchan" && req.method === "POST") return testServerChanEndpoint(res);
     if (req.url?.startsWith("/api/")) return sendJson(res, { error: "Not found" }, 404);
     return serveStatic(req, res);
@@ -121,6 +122,47 @@ async function runIncomeEndpoint(res) {
   const result = await runIncomeCheck({ force: true });
   startIncomeScheduler();
   return sendJson(res, result);
+}
+
+async function pushIncomeEndpoint(res) {
+  let income = incomeState;
+  if (!income?.ready || !Array.isArray(income.items) || !income.items.length) {
+    income = await runIncomeCheck({ force: true });
+    startIncomeScheduler();
+  }
+  if (!income.ready || !Array.isArray(income.items) || !income.items.length) {
+    return sendJson(res, { error: income.error || "收益数据未准备好" }, 400);
+  }
+
+  try {
+    await sendIncomeServerChanNotification(income);
+    incomeState = normalizeIncomeState({
+      ...income,
+      notification: {
+        ...(income.notification || {}),
+        date: income.date,
+        sentAt: new Date().toISOString(),
+        manualSentAt: new Date().toISOString(),
+        failedAt: null,
+        error: null
+      }
+    });
+    await persistIncomeState();
+    await publish();
+    return sendJson(res, { ok: true, message: "收益推送已发送", income: incomeState });
+  } catch (error) {
+    incomeState = normalizeIncomeState({
+      ...income,
+      notification: {
+        ...(income.notification || {}),
+        failedAt: new Date().toISOString(),
+        error: error.message || "收益推送失败"
+      }
+    });
+    await persistIncomeState();
+    await publish();
+    return sendJson(res, { error: error.message || "收益推送失败" }, 500);
+  }
 }
 
 async function testServerChanEndpoint(res) {
@@ -412,11 +454,9 @@ function buildIncomeServerChanMessage(income) {
   const detail = items.length
     ? items.map((item) => `- ${item.remark || item.host || item.uuid}: 收益 ¥${formatCurrencyText(item.incomeYuan)}，结算流量 ${formatGbText(item.flowGb)}`).join("\n")
     : "- 暂无收益明细";
-  const monthlyLines = month ? [
-    `- 本月税前收益: ¥${formatCurrencyText(month.totalIncomeYuan)}`,
-    `- 本月税后收益(${formatPercentText(month.taxRate * 100)}%): ¥${formatCurrencyText(month.netIncomeYuan)}`,
-    `- 每月固定支出: ¥${formatCurrencyText(month.monthlyFixedExpenseYuan)}`,
-    `- 本月净利润: ¥${formatCurrencyText(month.netProfitYuan)}`
+  const summaryLines = month ? [
+    `- 税后收益: ¥${formatCurrencyText(month.netIncomeYuan)}`,
+    `- 净利润: ¥${formatCurrencyText(month.netProfitYuan)}`
   ] : [];
 
   return [
@@ -424,8 +464,7 @@ function buildIncomeServerChanMessage(income) {
     "",
     `- 昨日收益: ¥${formatCurrencyText(summary.totalIncomeYuan)}`,
     `- 昨日流量: ${formatGbText(summary.totalFlowGb)}`,
-    ...monthlyLines,
-    `- 节点数量: ${summary.count || items.length} 个`,
+    ...summaryLines,
     "",
     "#### 收益明细",
     detail
@@ -1581,10 +1620,15 @@ async function postServerChanMessage(title, desp) {
   }
 
   const url = `https://sctapi.ftqq.com/${encodeURIComponent(sendKey)}.send`;
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ title, desp }).toString()
+  }, {
+    timeoutMs: Number(config.target?.timeoutMs || 15000),
+    retries: 1,
+    retryDelayMs: 800,
+    label: "Server酱推送"
   });
   const text = await response.text();
   let payload = {};

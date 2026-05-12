@@ -28,7 +28,11 @@ async function runIteration(index) {
   assert(css.includes("resource-tile"), `iteration ${index}: stylesheet missing resource tile styles`);
 
   const stateBefore = await apiGet("/api/state");
-  const resources = stateBefore.state?.latest?.resources || [];
+  let resources = stateBefore.state?.latest?.resources || [];
+  if (!resources.length) {
+    const seeded = await apiPost("/api/check");
+    resources = seeded.resources || [];
+  }
   assert(Array.isArray(resources), `iteration ${index}: resources is not an array`);
   assert(resources.length > 0, `iteration ${index}: no resources loaded`);
 

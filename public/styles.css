@@ -428,11 +428,15 @@ summary:focus {
   font-size: calc(16px * var(--tile-scale));
 }
 
-.node-title-row {
+.tile-title-row {
   display: flex;
   align-items: center;
   gap: calc(8px * var(--tile-scale));
   flex-wrap: wrap;
+  min-width: 0;
+}
+
+.tile-title-row strong {
   min-width: 0;
 }
 
@@ -452,19 +456,36 @@ summary:focus {
 }
 
 .drag-handle {
-  width: calc(22px * var(--tile-scale));
+  flex: 0 0 auto;
+  width: calc(16px * var(--tile-scale));
   height: calc(22px * var(--tile-scale));
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--muted);
-  background: #fff;
-  font-weight: 700;
-  line-height: 1;
+  margin-left: calc(-2px * var(--tile-scale));
+  border: 0;
+  color: #9aa7b2;
+  background: transparent;
   cursor: grab;
+  font-size: calc(18px * var(--tile-scale));
+  font-weight: 800;
+  line-height: 1;
   user-select: none;
+  transition: color 0.15s ease;
+}
+
+.drag-handle::before {
+  content: none;
+}
+
+.drag-handle:hover {
+  color: var(--accent);
+}
+
+.resource-tile.dragging .drag-handle,
+.income-tile.dragging .drag-handle {
+  cursor: grabbing;
+  color: var(--accent);
 }
 
 .uuid-button {
@@ -753,7 +774,7 @@ summary:focus {
 
 .tile-income-strip span,
 .income-summary-card span,
-.income-tile-head span,
+.income-tile-head span:not(.drag-handle),
 .income-metrics span {
   display: block;
   color: var(--muted);
@@ -916,10 +937,7 @@ summary:focus {
 }
 
 .income-name-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: calc(7px * var(--tile-scale));
+  gap: calc(8px * var(--tile-scale));
 }
 
 .income-metrics {

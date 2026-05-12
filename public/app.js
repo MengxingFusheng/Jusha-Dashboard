@@ -17,6 +17,7 @@ const els = {
   incomeTileScale: document.querySelector("#incomeTileScale"),
   incomeTileScaleValue: document.querySelector("#incomeTileScaleValue"),
   incomeCheckNow: document.querySelector("#incomeCheckNow"),
+  incomePushNow: document.querySelector("#incomePushNow"),
   monthlyFixedExpense: document.querySelector("#monthlyFixedExpenseYuan"),
   saveFixedExpense: document.querySelector("[data-action='save-fixed-expense']"),
   saveMessage: document.querySelector("#saveMessage"),
@@ -63,6 +64,7 @@ const DEFAULT_CHART_LOOKBACK_MINUTES = 24 * 60;
 
 els.checkNow.addEventListener("click", () => runAction("/api/check", els.checkNow, "检查完成"));
 els.incomeCheckNow.addEventListener("click", () => runAction("/api/income/check", els.incomeCheckNow, "收益检查完成"));
+els.incomePushNow?.addEventListener("click", () => runAction("/api/income/push", els.incomePushNow, "收益推送已发送"));
 els.monthlyFixedExpense?.addEventListener("change", () => saveMonthlyFixedExpense(els.monthlyFixedExpense));
 els.monthlyFixedExpense?.addEventListener("keydown", onFixedExpenseKeydown);
 els.saveFixedExpense?.addEventListener("click", () => saveMonthlyFixedExpense(els.monthlyFixedExpense, els.saveFixedExpense));
@@ -119,9 +121,9 @@ loadState()
   });
 
 async function loadState() {
-  return fetch("/api/state")
-  .then((res) => res.json())
-  .then(render);
+  const { body } = await fetchJson("/api/state", {}, 15000);
+  render(body);
+  return body;
 }
 
 function render(payload) {
@@ -213,8 +215,8 @@ function renderResources(resources, metrics = {}, history = [], nodeSettings = {
         <button type="button" class="tile-hide-button" data-action="hide-node" data-uuid="${escapeHtml(item.uuid)}" title="隐藏" aria-label="隐藏">&times;</button>
         <div class="resource-tile-head">
           <div>
-            <div class="node-title-row">
-              <span class="drag-handle" title="拖动排序">&#8942;</span>
+            <div class="tile-title-row node-title-row">
+              <span class="drag-handle" title="拖动排序" aria-hidden="true">&#8942;</span>
               <strong>${escapeHtml(item.remark || "未命名节点")}</strong>
               ${renderUnitPriceTag(incomeItem)}
             </div>
@@ -388,8 +390,8 @@ function renderIncomePanel(income = {}, resources = [], nodeSettings = {}, confi
       <article class="income-tile" draggable="true" data-uuid="${escapeHtml(item.uuid)}">
         <div class="income-tile-head">
           <div>
-            <div class="income-name-row">
-              <span class="drag-handle" title="拖动排序">&#8942;</span>
+            <div class="tile-title-row income-name-row">
+              <span class="drag-handle" title="拖动排序" aria-hidden="true">&#8942;</span>
               <strong>${escapeHtml(name)}</strong>
               ${renderUnitPriceTag(item)}
             </div>
@@ -1595,15 +1597,29 @@ async function runAction(url, button, successText, messageEl = els.saveMessage) 
   button.disabled = true;
   messageEl.textContent = "处理中...";
   try {
-    const res = await fetch(url, { method: "POST" });
-    const body = await res.json();
+    const { res, body } = await fetchJson(url, { method: "POST" }, 45000);
     if (!res.ok) throw new Error(body.error || "操作失败");
-    await loadState();
+    await loadState().catch(() => {});
     messageEl.textContent = successText;
   } catch (error) {
-    messageEl.textContent = error.message;
+    messageEl.textContent = error.name === "AbortError" ? "请求超时，请稍后重试" : error.message;
   } finally {
     button.disabled = false;
+  }
+}
+
+async function fetchJson(url, options = {}, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    const body = await res.json();
+    return { res, body };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
